@@ -2,8 +2,37 @@
 name = "paprika-vdagent"
 version = "0.1.0"
 edition = "2024"
-license = "MIT OR Apache-2.0"
+license = "GPL-3.0-only"
 description = "Standalone Wayland SPICE clipboard bridge for Linux guests"
+readme = "README.md"
+
+[package.metadata.deb]
+depends = "$auto"
+section = "utils"
+priority = "optional"
+maintainer = "Angelo Delicato <thelicato@duck.com>"
+copyright = "thelicato"
+extended-description = """\
+paprika-vdagent is a standalone Wayland clipboard bridge for SPICE/QEMU guests.
+It owns the SPICE virtio clipboard channel directly and integrates with wlroots-
+style Wayland compositors without relying on X11 clipboard mirroring.
+"""
+assets = [
+  ["target/release/paprika-vdagent", "usr/bin/paprika-vdagent", "755"],
+  ["packaging/systemd/user/paprika-vdagent.service", "usr/lib/systemd/user/paprika-vdagent.service", "644"],
+  ["README.md", "usr/share/doc/paprika-vdagent/README.md", "644"],
+  ["docs/architecture.md", "usr/share/doc/paprika-vdagent/architecture.md", "644"],
+  ["LICENSE", "usr/share/doc/paprika-vdagent/LICENSE", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+  { source = "target/release/paprika-vdagent", dest = "/usr/bin/paprika-vdagent", mode = "0755" },
+  { source = "packaging/systemd/user/paprika-vdagent.service", dest = "/usr/lib/systemd/user/paprika-vdagent.service", mode = "0644" },
+  { source = "README.md", dest = "/usr/share/doc/paprika-vdagent/README.md", mode = "0644", doc = true },
+  { source = "docs/architecture.md", dest = "/usr/share/doc/paprika-vdagent/architecture.md", mode = "0644", doc = true },
+  { source = "LICENSE", dest = "/usr/share/licenses/paprika-vdagent/LICENSE", mode = "0644", doc = true },
+]
 
 [dependencies]
 anyhow = "1.0.100"
