@@ -7,6 +7,8 @@ use std::thread;
 use anyhow::{Context, Result, anyhow, bail};
 use tracing::{debug, info, trace, warn};
 
+use crate::selection::ClipboardSelection;
+
 const VDP_CLIENT_PORT: u32 = 1;
 const VD_AGENT_PROTOCOL: u32 = 1;
 
@@ -24,8 +26,6 @@ const VD_AGENT_CAP_CLIPBOARD_SELECTION: usize = 6;
 const VD_AGENT_CAP_CLIPBOARD_NO_RELEASE_ON_REGRAB: usize = 16;
 const VD_AGENT_CAP_CLIPBOARD_GRAB_SERIAL: usize = 17;
 
-const VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD: u8 = 0;
-
 #[derive(Debug, Clone)]
 pub struct PeerCapabilities {
     pub clipboard_by_demand: bool,
@@ -37,17 +37,22 @@ pub struct PeerCapabilities {
 pub enum TransportEvent {
     PeerCapabilities(PeerCapabilities),
     HostGrab {
+        selection: ClipboardSelection,
         types: Vec<u32>,
         serial: Option<u32>,
     },
     HostRequest {
+        selection: ClipboardSelection,
         data_type: u32,
     },
     HostData {
+        selection: ClipboardSelection,
         data_type: u32,
         data: Vec<u8>,
     },
-    HostRelease,
+    HostRelease {
+        selection: ClipboardSelection,
+    },
     Disconnected(String),
 }
 
@@ -119,7 +124,7 @@ impl SpiceTransport {
             .unwrap_or(false)
     }
 
-    pub fn send_clipboard_grab_text(&self) -> Result<bool> {
+    pub fn send_clipboard_grab_text(&self, selection: ClipboardSelection) -> Result<bool> {
         let (clipboard_selection, clipboard_grab_serial, serial) = {
             let mut state = self
                 .state
@@ -141,7 +146,7 @@ impl SpiceTransport {
 
         let mut payload = Vec::new();
         if clipboard_selection {
-            payload.extend_from_slice(&selection_prefix());
+            payload.extend_from_slice(&selection_prefix(selection));
         }
         if clipboard_grab_serial {
             payload.extend_from_slice(&serial.to_le_bytes());
@@ -149,11 +154,11 @@ impl SpiceTransport {
         payload.extend_from_slice(&VD_AGENT_CLIPBOARD_UTF8_TEXT.to_le_bytes());
 
         self.send_message(VD_AGENT_CLIPBOARD_GRAB, &payload)?;
-        info!("sent guest -> host clipboard GRAB (utf8-text, serial={serial})");
+        info!("sent guest -> host {selection} GRAB (utf8-text, serial={serial})");
         Ok(true)
     }
 
-    pub fn send_clipboard_request_text(&self) -> Result<()> {
+    pub fn send_clipboard_request_text(&self, selection: ClipboardSelection) -> Result<()> {
         let clipboard_selection = self
             .state
             .lock()
@@ -162,18 +167,18 @@ impl SpiceTransport {
 
         let mut payload = Vec::new();
         if clipboard_selection {
-            payload.extend_from_slice(&selection_prefix());
+            payload.extend_from_slice(&selection_prefix(selection));
         }
         payload.extend_from_slice(&VD_AGENT_CLIPBOARD_UTF8_TEXT.to_le_bytes());
         self.send_message(VD_AGENT_CLIPBOARD_REQUEST, &payload)?;
-        info!("sent guest -> host clipboard REQUEST (utf8-text)");
+        info!("sent guest -> host {selection} REQUEST (utf8-text)");
         Ok(())
     }
 
-    pub fn send_clipboard_text(&self, text: &str) -> Result<bool> {
+    pub fn send_clipboard_text(&self, selection: ClipboardSelection, text: &str) -> Result<bool> {
         if text.len() > self.max_text_bytes {
             warn!(
-                "refusing to send clipboard text larger than configured limit: {} > {}",
+                "refusing to send {selection} text larger than configured limit: {} > {}",
                 text.len(),
                 self.max_text_bytes
             );
@@ -188,17 +193,17 @@ impl SpiceTransport {
 
         let mut payload = Vec::new();
         if clipboard_selection {
-            payload.extend_from_slice(&selection_prefix());
+            payload.extend_from_slice(&selection_prefix(selection));
         }
         payload.extend_from_slice(&VD_AGENT_CLIPBOARD_UTF8_TEXT.to_le_bytes());
         payload.extend_from_slice(text.as_bytes());
 
         self.send_message(VD_AGENT_CLIPBOARD, &payload)?;
-        info!("sent guest -> host clipboard DATA ({} bytes)", text.len());
+        info!("sent guest -> host {selection} DATA ({} bytes)", text.len());
         Ok(true)
     }
 
-    pub fn send_empty_clipboard_data(&self) -> Result<()> {
+    pub fn send_empty_clipboard_data(&self, selection: ClipboardSelection) -> Result<()> {
         let clipboard_selection = self
             .state
             .lock()
@@ -207,16 +212,16 @@ impl SpiceTransport {
 
         let mut payload = Vec::new();
         if clipboard_selection {
-            payload.extend_from_slice(&selection_prefix());
+            payload.extend_from_slice(&selection_prefix(selection));
         }
         payload.extend_from_slice(&VD_AGENT_CLIPBOARD_NONE.to_le_bytes());
 
         self.send_message(VD_AGENT_CLIPBOARD, &payload)?;
-        info!("sent guest -> host empty clipboard DATA");
+        info!("sent guest -> host empty {selection} DATA");
         Ok(())
     }
 
-    pub fn send_clipboard_release(&self) -> Result<bool> {
+    pub fn send_clipboard_release(&self, selection: ClipboardSelection) -> Result<bool> {
         let clipboard_selection = self
             .state
             .lock()
@@ -230,11 +235,11 @@ impl SpiceTransport {
 
         let mut payload = Vec::new();
         if clipboard_selection {
-            payload.extend_from_slice(&selection_prefix());
+            payload.extend_from_slice(&selection_prefix(selection));
         }
 
         self.send_message(VD_AGENT_CLIPBOARD_RELEASE, &payload)?;
-        info!("sent guest -> host clipboard RELEASE");
+        info!("sent guest -> host {selection} RELEASE");
         Ok(true)
     }
 
@@ -345,46 +350,63 @@ fn reader_loop(
                 }
             }
             VD_AGENT_CLIPBOARD_GRAB => {
-                let (selection, serial, types) = parse_clipboard_grab(&state, &data)?;
-                if selection != VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD {
-                    debug!("ignoring non-regular clipboard selection {selection}");
+                let (selection_id, serial, types) = parse_clipboard_grab(&state, &data)?;
+                let Some(selection) = ClipboardSelection::from_spice_id(selection_id) else {
+                    debug!("ignoring unsupported clipboard selection {}", selection_id);
                     continue;
-                }
+                };
                 sender
-                    .send(TransportEvent::HostGrab { types, serial })
+                    .send(TransportEvent::HostGrab {
+                        selection,
+                        types,
+                        serial,
+                    })
                     .context("failed to send HostGrab event")?;
             }
             VD_AGENT_CLIPBOARD_REQUEST => {
-                let (selection, data_type) = parse_clipboard_request(&state, &data)?;
-                if selection != VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD {
-                    debug!("ignoring non-regular clipboard request for selection {selection}");
+                let (selection_id, data_type) = parse_clipboard_request(&state, &data)?;
+                let Some(selection) = ClipboardSelection::from_spice_id(selection_id) else {
+                    debug!(
+                        "ignoring unsupported clipboard request selection {}",
+                        selection_id
+                    );
                     continue;
-                }
+                };
                 sender
-                    .send(TransportEvent::HostRequest { data_type })
+                    .send(TransportEvent::HostRequest {
+                        selection,
+                        data_type,
+                    })
                     .context("failed to send HostRequest event")?;
             }
             VD_AGENT_CLIPBOARD => {
-                let (selection, data_type, payload) = parse_clipboard_data(&state, &data)?;
-                if selection != VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD {
-                    debug!("ignoring non-regular clipboard data for selection {selection}");
+                let (selection_id, data_type, payload) = parse_clipboard_data(&state, &data)?;
+                let Some(selection) = ClipboardSelection::from_spice_id(selection_id) else {
+                    debug!(
+                        "ignoring unsupported clipboard data selection {}",
+                        selection_id
+                    );
                     continue;
-                }
+                };
                 sender
                     .send(TransportEvent::HostData {
+                        selection,
                         data_type,
                         data: payload,
                     })
                     .context("failed to send HostData event")?;
             }
             VD_AGENT_CLIPBOARD_RELEASE => {
-                let selection = parse_clipboard_release(&state, &data)?;
-                if selection != VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD {
-                    debug!("ignoring non-regular clipboard release for selection {selection}");
+                let selection_id = parse_clipboard_release(&state, &data)?;
+                let Some(selection) = ClipboardSelection::from_spice_id(selection_id) else {
+                    debug!(
+                        "ignoring unsupported clipboard release selection {}",
+                        selection_id
+                    );
                     continue;
-                }
+                };
                 sender
-                    .send(TransportEvent::HostRelease)
+                    .send(TransportEvent::HostRelease { selection })
                     .context("failed to send HostRelease event")?;
             }
             other => {
@@ -462,7 +484,7 @@ fn parse_clipboard_grab(
 ) -> Result<(u8, Option<u32>, Vec<u32>)> {
     let guard = state.lock().map_err(|_| anyhow!("state mutex poisoned"))?;
     let mut offset = 0usize;
-    let mut selection = VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD;
+    let mut selection = ClipboardSelection::Clipboard.spice_id();
     let mut serial = None;
 
     if guard.clipboard_selection {
@@ -503,16 +525,14 @@ fn parse_clipboard_grab(
         types.push(le_u32(chunk));
     }
 
-    debug!(
-        "received host -> guest clipboard GRAB selection={selection} serial={serial:?} types={types:?}"
-    );
+    debug!("received host -> guest GRAB selection={selection} serial={serial:?} types={types:?}");
     Ok((selection, serial, types))
 }
 
 fn parse_clipboard_request(state: &Arc<Mutex<TransportState>>, data: &[u8]) -> Result<(u8, u32)> {
     let guard = state.lock().map_err(|_| anyhow!("state mutex poisoned"))?;
     let mut offset = 0usize;
-    let mut selection = VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD;
+    let mut selection = ClipboardSelection::Clipboard.spice_id();
 
     if guard.clipboard_selection {
         if data.len() < 8 {
@@ -525,7 +545,7 @@ fn parse_clipboard_request(state: &Arc<Mutex<TransportState>>, data: &[u8]) -> R
     }
 
     let data_type = le_u32(&data[offset..offset + 4]);
-    debug!("received host -> guest clipboard REQUEST selection={selection} type={data_type}");
+    debug!("received host -> guest REQUEST selection={selection} type={data_type}");
     Ok((selection, data_type))
 }
 
@@ -535,7 +555,7 @@ fn parse_clipboard_data(
 ) -> Result<(u8, u32, Vec<u8>)> {
     let guard = state.lock().map_err(|_| anyhow!("state mutex poisoned"))?;
     let mut offset = 0usize;
-    let mut selection = VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD;
+    let mut selection = ClipboardSelection::Clipboard.spice_id();
 
     if guard.clipboard_selection {
         if data.len() < 8 {
@@ -551,7 +571,7 @@ fn parse_clipboard_data(
     offset += 4;
     let payload = data[offset..].to_vec();
     debug!(
-        "received host -> guest clipboard DATA selection={selection} type={data_type} bytes={}",
+        "received host -> guest DATA selection={selection} type={data_type} bytes={}",
         payload.len()
     );
     Ok((selection, data_type, payload))
@@ -565,15 +585,15 @@ fn parse_clipboard_release(state: &Arc<Mutex<TransportState>>, data: &[u8]) -> R
         }
         data[0]
     } else {
-        VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD
+        ClipboardSelection::Clipboard.spice_id()
     };
 
-    debug!("received host -> guest clipboard RELEASE selection={selection}");
+    debug!("received host -> guest RELEASE selection={selection}");
     Ok(selection)
 }
 
-fn selection_prefix() -> [u8; 4] {
-    [VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD, 0, 0, 0]
+fn selection_prefix(selection: ClipboardSelection) -> [u8; 4] {
+    [selection.spice_id(), 0, 0, 0]
 }
 
 fn set_capability(bits: &mut u32, cap: usize) {
@@ -597,7 +617,11 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
-    fn state_with(selection: bool, serial: bool, serial_counter: u32) -> Arc<Mutex<TransportState>> {
+    fn state_with(
+        selection: bool,
+        serial: bool,
+        serial_counter: u32,
+    ) -> Arc<Mutex<TransportState>> {
         Arc::new(Mutex::new(TransportState {
             peer_caps: Vec::new(),
             clipboard_by_demand: true,
@@ -633,34 +657,49 @@ mod tests {
     }
 
     #[test]
-    fn clipboard_grab_parses_selection_and_serial() {
+    fn clipboard_grab_parses_clipboard_selection_and_serial() {
         let state = state_with(true, true, 4);
         let mut payload = Vec::new();
-        payload.extend_from_slice(&selection_prefix());
+        payload.extend_from_slice(&selection_prefix(ClipboardSelection::Clipboard));
         payload.extend_from_slice(&9u32.to_le_bytes());
         payload.extend_from_slice(&VD_AGENT_CLIPBOARD_UTF8_TEXT.to_le_bytes());
 
         let (selection, serial, types) =
             parse_clipboard_grab(&state, &payload).expect("clipboard grab should parse");
 
-        assert_eq!(selection, VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD);
+        assert_eq!(selection, ClipboardSelection::Clipboard.spice_id());
         assert_eq!(serial, Some(9));
         assert_eq!(types, vec![VD_AGENT_CLIPBOARD_UTF8_TEXT]);
         assert_eq!(state.lock().unwrap().serial_counter, 9);
     }
 
     #[test]
+    fn clipboard_grab_parses_primary_selection() {
+        let state = state_with(true, false, 0);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&selection_prefix(ClipboardSelection::Primary));
+        payload.extend_from_slice(&VD_AGENT_CLIPBOARD_UTF8_TEXT.to_le_bytes());
+
+        let (selection, serial, types) =
+            parse_clipboard_grab(&state, &payload).expect("clipboard grab should parse");
+
+        assert_eq!(selection, ClipboardSelection::Primary.spice_id());
+        assert_eq!(serial, None);
+        assert_eq!(types, vec![VD_AGENT_CLIPBOARD_UTF8_TEXT]);
+    }
+
+    #[test]
     fn stale_clipboard_grab_serial_is_discarded() {
         let state = state_with(true, true, 10);
         let mut payload = Vec::new();
-        payload.extend_from_slice(&selection_prefix());
+        payload.extend_from_slice(&selection_prefix(ClipboardSelection::Clipboard));
         payload.extend_from_slice(&3u32.to_le_bytes());
         payload.extend_from_slice(&VD_AGENT_CLIPBOARD_UTF8_TEXT.to_le_bytes());
 
         let (selection, serial, types) =
             parse_clipboard_grab(&state, &payload).expect("clipboard grab should parse");
 
-        assert_eq!(selection, VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD);
+        assert_eq!(selection, ClipboardSelection::Clipboard.spice_id());
         assert_eq!(serial, Some(3));
         assert!(types.is_empty());
         assert_eq!(state.lock().unwrap().serial_counter, 10);

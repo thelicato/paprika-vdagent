@@ -19,11 +19,12 @@ use wayland_protocols_wlr::data_control::v1::client::zwlr_data_control_device_v1
 use wayland_protocols_wlr::data_control::v1::client::zwlr_data_control_manager_v1::ZwlrDataControlManagerV1;
 use wayland_protocols_wlr::data_control::v1::client::zwlr_data_control_offer_v1::ZwlrDataControlOfferV1;
 
+use crate::selection::ClipboardSelection;
 use crate::wayland::SeatSelector;
 
 #[derive(Debug)]
 pub enum WatchEvent {
-    SelectionChanged,
+    SelectionChanged(ClipboardSelection),
     Disconnected(String),
 }
 
@@ -34,14 +35,22 @@ enum WatchManager {
 }
 
 impl WatchManager {
-    fn bind(globals: &wayland_client::globals::GlobalList, qh: &QueueHandle<WatchState>) -> Result<Self> {
+    fn bind(
+        globals: &wayland_client::globals::GlobalList,
+        qh: &QueueHandle<WatchState>,
+    ) -> Result<Self> {
         if let Ok(manager) = globals.bind::<ExtDataControlManagerV1, _, _>(qh, 1..=1, ()) {
             info!("using ext-data-control for event-driven clipboard watching");
             return Ok(Self::Ext(manager));
         }
 
+        if let Ok(manager) = globals.bind::<ZwlrDataControlManagerV1, _, _>(qh, 2..=2, ()) {
+            info!("using wlr-data-control v2 for event-driven clipboard watching");
+            return Ok(Self::Zwlr(manager));
+        }
+
         if let Ok(manager) = globals.bind::<ZwlrDataControlManagerV1, _, _>(qh, 1..=1, ()) {
-            info!("using wlr-data-control for event-driven clipboard watching");
+            info!("using wlr-data-control v1 for event-driven clipboard watching");
             return Ok(Self::Zwlr(manager));
         }
 
@@ -51,7 +60,9 @@ impl WatchManager {
     fn get_data_device(&self, seat: &WlSeat, qh: &QueueHandle<WatchState>) -> WatchDevice {
         match self {
             Self::Ext(manager) => WatchDevice::Ext(manager.get_data_device(seat, qh, seat.clone())),
-            Self::Zwlr(manager) => WatchDevice::Zwlr(manager.get_data_device(seat, qh, seat.clone())),
+            Self::Zwlr(manager) => {
+                WatchDevice::Zwlr(manager.get_data_device(seat, qh, seat.clone()))
+            }
         }
     }
 }
@@ -141,7 +152,7 @@ fn initialize_watcher(
 
     let mut state = WatchState {
         seat,
-        sender: sender.clone(),
+        sender,
         seats,
         armed: false,
     };
@@ -282,7 +293,18 @@ impl Dispatch<ZwlrDataControlDeviceV1, WlSeat> for WatchState {
                 if state.armed && state.should_notify(seat) {
                     debug!("Wayland clipboard selection changed");
                     let _ = id;
-                    let _ = state.sender.send(WatchEvent::SelectionChanged);
+                    let _ = state
+                        .sender
+                        .send(WatchEvent::SelectionChanged(ClipboardSelection::Clipboard));
+                }
+            }
+            zwlr_data_control_device_v1::Event::PrimarySelection { id } => {
+                if state.armed && state.should_notify(seat) {
+                    debug!("Wayland primary selection changed");
+                    let _ = id;
+                    let _ = state
+                        .sender
+                        .send(WatchEvent::SelectionChanged(ClipboardSelection::Primary));
                 }
             }
             zwlr_data_control_device_v1::Event::Finished => {
@@ -314,7 +336,18 @@ impl Dispatch<ExtDataControlDeviceV1, WlSeat> for WatchState {
                 if state.armed && state.should_notify(seat) {
                     debug!("Wayland clipboard selection changed");
                     let _ = id;
-                    let _ = state.sender.send(WatchEvent::SelectionChanged);
+                    let _ = state
+                        .sender
+                        .send(WatchEvent::SelectionChanged(ClipboardSelection::Clipboard));
+                }
+            }
+            ext_data_control_device_v1::Event::PrimarySelection { id } => {
+                if state.armed && state.should_notify(seat) {
+                    debug!("Wayland primary selection changed");
+                    let _ = id;
+                    let _ = state
+                        .sender
+                        .send(WatchEvent::SelectionChanged(ClipboardSelection::Primary));
                 }
             }
             ext_data_control_device_v1::Event::Finished => {

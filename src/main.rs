@@ -1,3 +1,4 @@
+mod selection;
 mod spice;
 mod wayland;
 mod wayland_watch;
@@ -9,6 +10,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
+use selection::ClipboardSelection;
 use spice::{PeerCapabilities, SpiceTransport, TransportEvent, VD_AGENT_CLIPBOARD_UTF8_TEXT};
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -42,33 +44,47 @@ enum ClipboardOwner {
     Host,
 }
 
-#[derive(Debug)]
-struct BridgeState {
+#[derive(Debug, Default)]
+struct SelectionState {
     owner: ClipboardOwner,
     guest_cache: Option<String>,
     host_cache: Option<String>,
     last_wayland_text: Option<String>,
     suppress_text: Option<String>,
     suppress_empty: bool,
+}
+
+#[derive(Debug, Default)]
+struct BridgeState {
+    clipboard: SelectionState,
+    primary: SelectionState,
     peer_caps: Option<PeerCapabilities>,
 }
 
 enum BridgeEvent {
     Transport(TransportEvent),
-    WaylandSelectionChanged,
+    WaylandSelectionChanged(ClipboardSelection),
     WaylandWatcherDisconnected(String),
 }
 
-impl Default for BridgeState {
+impl Default for ClipboardOwner {
     fn default() -> Self {
-        Self {
-            owner: ClipboardOwner::Empty,
-            guest_cache: None,
-            host_cache: None,
-            last_wayland_text: None,
-            suppress_text: None,
-            suppress_empty: false,
-            peer_caps: None,
+        Self::Empty
+    }
+}
+
+impl BridgeState {
+    fn selection_state(&self, selection: ClipboardSelection) -> &SelectionState {
+        match selection {
+            ClipboardSelection::Clipboard => &self.clipboard,
+            ClipboardSelection::Primary => &self.primary,
+        }
+    }
+
+    fn selection_state_mut(&mut self, selection: ClipboardSelection) -> &mut SelectionState {
+        match selection {
+            ClipboardSelection::Clipboard => &mut self.clipboard,
+            ClipboardSelection::Primary => &mut self.primary,
         }
     }
 }
@@ -86,6 +102,12 @@ fn run(cli: Cli) -> Result<()> {
         .map(|seat| SeatSelector::Specific(seat.clone()))
         .unwrap_or(SeatSelector::Unspecified);
     let clipboard = WaylandClipboard::new(cli.max_text_bytes, seat.clone())?;
+
+    if !clipboard.selection_supported(ClipboardSelection::Primary) {
+        info!(
+            "Wayland primary selection is not supported by this compositor; primary sync is disabled"
+        );
+    }
 
     let (bridge_tx, bridge_rx) = mpsc::channel();
 
@@ -112,14 +134,17 @@ fn run(cli: Cli) -> Result<()> {
         }
     }
 
-    if let Some(text) = clipboard.read_text()? {
-        info!(
-            "detected existing guest clipboard text at startup ({} bytes)",
-            text.len()
-        );
-        state.owner = ClipboardOwner::Guest;
-        state.guest_cache = Some(text.clone());
-        state.last_wayland_text = Some(text);
+    for selection in ClipboardSelection::ALL {
+        if let Some(text) = clipboard.read_text(selection)? {
+            info!(
+                "detected existing guest {selection} text at startup ({} bytes)",
+                text.len()
+            );
+            let selection_state = state.selection_state_mut(selection);
+            selection_state.owner = ClipboardOwner::Guest;
+            selection_state.guest_cache = Some(text.clone());
+            selection_state.last_wayland_text = Some(text);
+        }
     }
 
     let poll_interval = Duration::from_millis(cli.poll_ms);
@@ -178,8 +203,10 @@ fn run(cli: Cli) -> Result<()> {
                 }
             }
 
-            let snapshot = clipboard.read_text()?;
-            handle_wayland_snapshot(&transport, &mut state, snapshot)?;
+            for selection in ClipboardSelection::ALL {
+                let snapshot = clipboard.read_text(selection)?;
+                handle_wayland_snapshot(&transport, &mut state, selection, snapshot)?;
+            }
         }
     }
 }
@@ -211,7 +238,9 @@ fn spawn_wayland_forwarder(seat: SeatSelector, tx: mpsc::Sender<BridgeEvent>) ->
         .spawn(move || {
             while let Ok(event) = watch_rx.recv() {
                 let bridge_event = match event {
-                    WatchEvent::SelectionChanged => BridgeEvent::WaylandSelectionChanged,
+                    WatchEvent::SelectionChanged(selection) => {
+                        BridgeEvent::WaylandSelectionChanged(selection)
+                    }
                     WatchEvent::Disconnected(message) => {
                         BridgeEvent::WaylandWatcherDisconnected(message)
                     }
@@ -243,60 +272,86 @@ fn handle_bridge_event(
                 );
                 state.peer_caps = Some(peer);
 
-                if state.owner == ClipboardOwner::Guest {
-                    if let Some(text) = state.guest_cache.as_ref() {
-                        let sent = transport.send_clipboard_grab_text()?;
-                        if sent {
-                            info!("announced cached guest clipboard after capability negotiation");
-                            debug!("cached guest clipboard length={} bytes", text.len());
+                for selection in ClipboardSelection::ALL {
+                    let selection_state = state.selection_state(selection);
+                    if selection_state.owner == ClipboardOwner::Guest {
+                        if let Some(text) = selection_state.guest_cache.as_ref() {
+                            let sent = transport.send_clipboard_grab_text(selection)?;
+                            if sent {
+                                info!(
+                                    "announced cached guest {selection} after capability negotiation"
+                                );
+                                debug!("cached guest {selection} length={} bytes", text.len());
+                            }
                         }
                     }
                 }
             }
-            TransportEvent::HostGrab { types, serial } => {
+            TransportEvent::HostGrab {
+                selection,
+                types,
+                serial,
+            } => {
                 if types.is_empty() {
-                    debug!("discarded stale or empty host clipboard GRAB");
+                    debug!("discarded stale or empty host {selection} GRAB");
                     return Ok(());
                 }
 
-                info!("host claimed clipboard ownership (serial={serial:?}, types={types:?})");
+                info!("host claimed {selection} ownership (serial={serial:?}, types={types:?})");
                 if !types.contains(&VD_AGENT_CLIPBOARD_UTF8_TEXT) {
-                    warn!("host clipboard GRAB does not offer UTF-8 text, ignoring for v1");
-                    if state.owner == ClipboardOwner::Host && state.last_wayland_text.is_some() {
-                        clipboard.clear()?;
-                        state.suppress_empty = true;
-                        state.last_wayland_text = None;
-                        state.host_cache = None;
+                    warn!("host {selection} GRAB does not offer UTF-8 text, ignoring for now");
+
+                    let should_clear = {
+                        let selection_state = state.selection_state(selection);
+                        selection_state.owner == ClipboardOwner::Host
+                            && selection_state.last_wayland_text.is_some()
+                    };
+
+                    if should_clear {
+                        let _ = clipboard.clear(selection)?;
+                        let selection_state = state.selection_state_mut(selection);
+                        selection_state.suppress_empty = true;
+                        selection_state.last_wayland_text = None;
+                        selection_state.host_cache = None;
                     }
+
                     return Ok(());
                 }
 
-                transport.send_clipboard_request_text()?;
+                transport.send_clipboard_request_text(selection)?;
             }
-            TransportEvent::HostRequest { data_type } => {
-                info!("host requested clipboard data type={data_type}");
+            TransportEvent::HostRequest {
+                selection,
+                data_type,
+            } => {
+                info!("host requested {selection} data type={data_type}");
                 if data_type != VD_AGENT_CLIPBOARD_UTF8_TEXT {
                     warn!(
-                        "host requested unsupported clipboard type {data_type}, sending empty data"
+                        "host requested unsupported {selection} type {data_type}, sending empty data"
                     );
-                    transport.send_empty_clipboard_data()?;
+                    transport.send_empty_clipboard_data(selection)?;
                     return Ok(());
                 }
 
-                if let Some(text) = state
+                let selection_state = state.selection_state(selection);
+                if let Some(text) = selection_state
                     .guest_cache
                     .as_deref()
-                    .or(state.last_wayland_text.as_deref())
+                    .or(selection_state.last_wayland_text.as_deref())
                 {
-                    transport.send_clipboard_text(text)?;
+                    transport.send_clipboard_text(selection, text)?;
                 } else {
-                    warn!("host requested clipboard text but guest cache is empty");
-                    transport.send_empty_clipboard_data()?;
+                    warn!("host requested {selection} text but guest cache is empty");
+                    transport.send_empty_clipboard_data(selection)?;
                 }
             }
-            TransportEvent::HostData { data_type, data } => {
+            TransportEvent::HostData {
+                selection,
+                data_type,
+                data,
+            } => {
                 if data_type != VD_AGENT_CLIPBOARD_UTF8_TEXT {
-                    warn!("host sent unsupported clipboard data type {data_type}, ignoring");
+                    warn!("host sent unsupported {selection} data type {data_type}, ignoring");
                     return Ok(());
                 }
 
@@ -304,42 +359,65 @@ fn handle_bridge_event(
                     .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned());
 
                 info!(
-                    "received host clipboard text ({} bytes), injecting into Wayland clipboard",
+                    "received host {selection} text ({} bytes), injecting into Wayland",
                     text.len()
                 );
 
-                clipboard.write_text(&text)?;
-                state.owner = ClipboardOwner::Host;
-                state.guest_cache = None;
-                state.host_cache = Some(text.clone());
-                state.suppress_text = Some(text.clone());
-                state.last_wayland_text = Some(text);
-            }
-            TransportEvent::HostRelease => {
-                info!("host released clipboard ownership");
-                let host_text = state.host_cache.take();
+                if !clipboard.write_text(selection, &text)? {
+                    warn!(
+                        "guest compositor does not support Wayland {selection}; ignoring incoming host data"
+                    );
+                    return Ok(());
+                }
 
-                if state.owner == ClipboardOwner::Host {
-                    if let Some(ref released_text) = host_text {
-                        if state.last_wayland_text.as_deref() == Some(released_text.as_str()) {
-                            clipboard.clear()?;
-                            state.suppress_empty = true;
-                            state.last_wayland_text = None;
-                            state.owner = ClipboardOwner::Empty;
-                            info!(
-                                "cleared Wayland clipboard because the active host-owned clipboard was released"
-                            );
-                        }
+                let selection_state = state.selection_state_mut(selection);
+                selection_state.owner = ClipboardOwner::Host;
+                selection_state.guest_cache = None;
+                selection_state.host_cache = Some(text.clone());
+                selection_state.suppress_text = Some(text.clone());
+                selection_state.last_wayland_text = Some(text);
+            }
+            TransportEvent::HostRelease { selection } => {
+                info!("host released {selection} ownership");
+
+                let (should_clear, released_text) = {
+                    let selection_state = state.selection_state_mut(selection);
+                    let released_text = selection_state.host_cache.take();
+                    let should_clear = selection_state.owner == ClipboardOwner::Host
+                        && released_text
+                            .as_ref()
+                            .and_then(|released_text| {
+                                selection_state
+                                    .last_wayland_text
+                                    .as_ref()
+                                    .map(|current| current == released_text)
+                            })
+                            .unwrap_or(false);
+                    (should_clear, released_text)
+                };
+
+                if should_clear {
+                    let cleared = clipboard.clear(selection)?;
+                    let selection_state = state.selection_state_mut(selection);
+                    if cleared {
+                        selection_state.suppress_empty = true;
                     }
+                    selection_state.last_wayland_text = None;
+                    selection_state.owner = ClipboardOwner::Empty;
+                    info!(
+                        "cleared Wayland {selection} because the active host-owned text was released"
+                    );
+                } else {
+                    let _ = released_text;
                 }
             }
             TransportEvent::Disconnected(message) => {
                 bail!("SPICE transport disconnected: {message}");
             }
         },
-        BridgeEvent::WaylandSelectionChanged => {
-            let snapshot = clipboard.read_text()?;
-            handle_wayland_snapshot(transport, state, snapshot)?;
+        BridgeEvent::WaylandSelectionChanged(selection) => {
+            let snapshot = clipboard.read_text(selection)?;
+            handle_wayland_snapshot(transport, state, selection, snapshot)?;
         }
         BridgeEvent::WaylandWatcherDisconnected(message) => {
             warn!("{message}; switching back to polling mode");
@@ -353,46 +431,49 @@ fn handle_bridge_event(
 fn handle_wayland_snapshot(
     transport: &SpiceTransport,
     state: &mut BridgeState,
+    selection: ClipboardSelection,
     snapshot: Option<String>,
 ) -> Result<()> {
+    let selection_state = state.selection_state_mut(selection);
+
     match snapshot {
         Some(text) => {
-            if state.last_wayland_text.as_ref() == Some(&text) {
+            if selection_state.last_wayland_text.as_ref() == Some(&text) {
                 return Ok(());
             }
 
-            if state.suppress_text.as_ref() == Some(&text) {
-                debug!("suppressed host->guest clipboard echo for matching Wayland text");
-                state.suppress_text = None;
-                state.last_wayland_text = Some(text);
+            if selection_state.suppress_text.as_ref() == Some(&text) {
+                debug!("suppressed host->guest {selection} echo for matching Wayland text");
+                selection_state.suppress_text = None;
+                selection_state.last_wayland_text = Some(text);
                 return Ok(());
             }
 
-            info!("guest Wayland clipboard changed ({} bytes)", text.len());
-            state.owner = ClipboardOwner::Guest;
-            state.guest_cache = Some(text.clone());
-            state.host_cache = None;
-            state.last_wayland_text = Some(text);
+            info!("guest Wayland {selection} changed ({} bytes)", text.len());
+            selection_state.owner = ClipboardOwner::Guest;
+            selection_state.guest_cache = Some(text.clone());
+            selection_state.host_cache = None;
+            selection_state.last_wayland_text = Some(text);
 
-            let _ = transport.send_clipboard_grab_text()?;
+            let _ = transport.send_clipboard_grab_text(selection)?;
         }
         None => {
-            if state.last_wayland_text.is_none() {
+            if selection_state.last_wayland_text.is_none() {
                 return Ok(());
             }
 
-            if state.suppress_empty {
-                debug!("suppressed local empty clipboard event caused by host RELEASE");
-                state.suppress_empty = false;
-                state.last_wayland_text = None;
+            if selection_state.suppress_empty {
+                debug!("suppressed local empty {selection} event caused by host RELEASE");
+                selection_state.suppress_empty = false;
+                selection_state.last_wayland_text = None;
                 return Ok(());
             }
 
-            info!("guest Wayland clipboard became empty");
-            state.owner = ClipboardOwner::Empty;
-            state.guest_cache = None;
-            state.last_wayland_text = None;
-            let _ = transport.send_clipboard_release()?;
+            info!("guest Wayland {selection} became empty");
+            selection_state.owner = ClipboardOwner::Empty;
+            selection_state.guest_cache = None;
+            selection_state.last_wayland_text = None;
+            let _ = transport.send_clipboard_release(selection)?;
         }
     }
 

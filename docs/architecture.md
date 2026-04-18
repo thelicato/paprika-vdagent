@@ -43,9 +43,9 @@ Technically, a custom Wayland agent could talk to `/run/spice-vdagentd/spice-vda
 
 ### Guest Wayland -> host
 
-1. The bridge watches the Wayland clipboard using `ext-data-control` or `wlr-data-control` selection events.
+1. The bridge watches the Wayland clipboard selections using `ext-data-control` or `wlr-data-control` selection events.
 2. When text changes, the bridge caches the UTF-8 text locally.
-3. It sends `VD_AGENT_CLIPBOARD_GRAB` for `VD_AGENT_CLIPBOARD_UTF8_TEXT`.
+3. It sends `VD_AGENT_CLIPBOARD_GRAB` for `VD_AGENT_CLIPBOARD_UTF8_TEXT` for the matching selection.
 4. When the host later sends `VD_AGENT_CLIPBOARD_REQUEST`, the bridge replies with `VD_AGENT_CLIPBOARD`.
 5. If the guest clipboard becomes empty, the bridge sends `VD_AGENT_CLIPBOARD_RELEASE`.
 
@@ -53,9 +53,9 @@ Technically, a custom Wayland agent could talk to `/run/spice-vdagentd/spice-vda
 
 1. The host side sends `VD_AGENT_CLIPBOARD_GRAB`.
 2. The bridge requests the text payload with `VD_AGENT_CLIPBOARD_REQUEST`.
-3. After `VD_AGENT_CLIPBOARD` arrives, the bridge writes that text into the Wayland clipboard using data-control.
+3. After `VD_AGENT_CLIPBOARD` arrives, the bridge writes that text into the matching Wayland selection using data-control.
 4. The bridge suppresses the immediate self-induced clipboard echo so the injected host clipboard is not reflected straight back to the host as a new guest grab.
-5. If the host sends `VD_AGENT_CLIPBOARD_RELEASE` and the bridge is still serving the host-owned text locally, the bridge clears the Wayland clipboard.
+5. If the host sends `VD_AGENT_CLIPBOARD_RELEASE` and the bridge is still serving the host-owned text locally, the bridge clears the matching Wayland selection.
 
 ## Wayland backend
 
@@ -69,6 +69,8 @@ That crate uses:
 For the first target, Hyprland/wlroots, `wlr-data-control` compatibility is the important path.
 
 Clipboard read/write still uses `wl-clipboard-rs`, but guest clipboard change detection now prefers a direct watcher thread using `ext-data-control` when available and `wlr-data-control` otherwise. If that watcher cannot be started, the bridge falls back to polling.
+
+Regular clipboard and primary selection are both supported in the current implementation. Secondary selection is still intentionally unsupported.
 
 ## SPICE protocol subset implemented in v1
 
@@ -85,14 +87,18 @@ Capabilities used:
 - `VD_AGENT_CAP_CLIPBOARD_NO_RELEASE_ON_REGRAB`
 - `VD_AGENT_CAP_CLIPBOARD_GRAB_SERIAL`
 
-Only the regular clipboard selection is implemented in v1.
+Currently implemented selections:
+
+- regular clipboard
+- primary selection
 
 ## Known limitations
 
 - Direct-virtio mode means this prototype must not run at the same time as `spice-vdagentd`
 - Clipboard only
-- Regular clipboard only
 - Text only
+- Secondary selection is not implemented
+- Primary selection depends on compositor support and host viewer/client support
 - Event-driven watch support currently depends on `ext-data-control` or `wlr-data-control`
 - Environments without both `ext-data-control` and `wlr-data-control` fall back to polling
 - No image, HTML, URI-list, or file-transfer support yet
