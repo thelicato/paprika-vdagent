@@ -1,0 +1,25 @@
+paprika_vdagent_note() {
+  cat <<'EOF'
+To use paprika-vdagent:
+
+  1. Stop spice-vdagentd and any spice-vdagent session process so they do not
+     compete for /dev/virtio-ports/com.redhat.spice.0.
+  2. Import your Wayland session environment into the systemd user manager:
+       systemctl --user import-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR HYPRLAND_INSTANCE_SIGNATURE
+  3. Enable and start the user service:
+       systemctl --user enable --now paprika-vdagent.service
+  4. Follow logs with:
+       journalctl --user -u paprika-vdagent.service -f
+
+If the virtio port is not writable by your user, grant temporary access with:
+  sudo setfacl -m u:$USER:rw /dev/virtio-ports/com.redhat.spice.0
+EOF
+}
+
+post_install() {
+  paprika_vdagent_note
+}
+
+post_upgrade() {
+  paprika_vdagent_note
+}

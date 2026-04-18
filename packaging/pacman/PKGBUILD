@@ -1,0 +1,60 @@
+# Local-checkout packaging recipe for pacman-based systems.
+# Run makepkg from packaging/pacman so it packages the current working tree.
+
+pkgname=paprika-vdagent
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Standalone Wayland SPICE clipboard bridge for Linux guests"
+arch=('x86_64' 'aarch64')
+url=''
+license=('GPL-3.0-only')
+depends=('glibc' 'wayland')
+makedepends=('cargo' 'pkgconf')
+optdepends=(
+  'acl: grant a desktop user access to /dev/virtio-ports/com.redhat.spice.0'
+  'wl-clipboard: manual clipboard testing tools'
+)
+install='paprika-vdagent.install'
+source=()
+sha256sums=()
+
+_source_root="$startdir/../.."
+_build_root="$srcdir/$pkgname-$pkgver"
+
+prepare() {
+  rm -rf "$_build_root"
+  mkdir -p "$_build_root"
+
+  bsdtar \
+    --exclude .git \
+    --exclude target \
+    --exclude dist \
+    -cf - \
+    -C "$_source_root" \
+    . | bsdtar -xf - -C "$_build_root"
+}
+
+build() {
+  cd "$_build_root"
+  cargo build --locked --release
+}
+
+check() {
+  cd "$_build_root"
+  cargo test --locked
+}
+
+package() {
+  cd "$_build_root"
+
+  install -Dm755 target/release/paprika-vdagent \
+    "$pkgdir/usr/bin/paprika-vdagent"
+  install -Dm644 packaging/systemd/user/paprika-vdagent.service \
+    "$pkgdir/usr/lib/systemd/user/paprika-vdagent.service"
+  install -Dm644 README.md \
+    "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 docs/architecture.md \
+    "$pkgdir/usr/share/doc/$pkgname/architecture.md"
+  install -Dm644 LICENSE \
+    "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

@@ -1,0 +1,111 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare-release:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          registry-url: https://registry.npmjs.org/
+
+      - name: Ensure GitHub release exists
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" \
+              --verify-tag \
+              --title "$GITHUB_REF_NAME" \
+              --notes "Release $GITHUB_REF_NAME"
+          fi
+
+      - name: Update release notes with changelogithub
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx changelogithub
+
+  build-artifacts:
+    needs: prepare-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dpkg-dev liblzma-dev libwayland-dev pkg-config wayland-protocols
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install packaging tools
+        run: cargo install --locked cargo-deb cargo-generate-rpm
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Build release binary
+        run: cargo build --locked --release
+
+      - name: Strip release binary
+        run: strip target/release/paprika-vdagent
+
+      - name: Assemble release archive
+        run: |
+          asset_name="paprika-vdagent-${GITHUB_REF_NAME}-linux-${{ matrix.arch }}.tar.gz"
+          bundle_dir="dist/paprika-vdagent-${GITHUB_REF_NAME}-linux-${{ matrix.arch }}"
+
+          rm -rf "$bundle_dir"
+          mkdir -p "$bundle_dir"
+
+          install -m755 target/release/paprika-vdagent "$bundle_dir/paprika-vdagent"
+          install -m644 README.md "$bundle_dir/README.md"
+          install -m644 LICENSE "$bundle_dir/LICENSE"
+          install -Dm644 packaging/systemd/user/paprika-vdagent.service \
+            "$bundle_dir/systemd/user/paprika-vdagent.service"
+
+          tar -C dist -czf "dist/$asset_name" "$(basename "$bundle_dir")"
+          rm -rf "$bundle_dir"
+
+      - name: Build Debian package
+        run: cargo deb --output "dist/paprika-vdagent-${GITHUB_REF_NAME}-linux-${{ matrix.arch }}.deb"
+
+      - name: Build RPM package
+        run: cargo generate-rpm -o "dist/paprika-vdagent-${GITHUB_REF_NAME}-linux-${{ matrix.arch }}.rpm"
+
+      - name: Upload release assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "$GITHUB_REF_NAME" dist/* --clobber

@@ -1,0 +1,15 @@
+[Unit]
+Description=Paprika Wayland SPICE clipboard bridge
+ConditionPathExists=/dev/virtio-ports/com.redhat.spice.0
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/paprika-vdagent
+Restart=on-failure
+RestartSec=2
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=default.target
