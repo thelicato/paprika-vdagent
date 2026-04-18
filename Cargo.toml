@@ -3,7 +3,7 @@ name = "paprika-vdagent"
 version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-only"
-description = "Standalone Wayland SPICE clipboard bridge for Linux guests"
+description = "Standalone Wayland SPICE clipboard and file-transfer bridge for Linux guests"
 readme = "README.md"
 
 [package.metadata.deb]
@@ -13,9 +13,10 @@ priority = "optional"
 maintainer = "Angelo Delicato <thelicato@duck.com>"
 copyright = "thelicato"
 extended-description = """\
-paprika-vdagent is a standalone Wayland clipboard bridge for SPICE/QEMU guests.
-It owns the SPICE virtio clipboard channel directly and integrates with wlroots-
-style Wayland compositors without relying on X11 clipboard mirroring.
+paprika-vdagent is a standalone Wayland clipboard and file-transfer bridge for
+SPICE/QEMU guests. It owns the SPICE virtio guest-agent channel directly and
+integrates with wlroots-style Wayland compositors without relying on X11
+clipboard mirroring.
 """
 assets = [
   ["target/release/paprika-vdagent", "usr/bin/paprika-vdagent", "755"],

@@ -17,9 +17,18 @@ const VD_AGENT_ANNOUNCE_CAPABILITIES: u32 = 6;
 const VD_AGENT_CLIPBOARD_GRAB: u32 = 7;
 const VD_AGENT_CLIPBOARD_REQUEST: u32 = 8;
 const VD_AGENT_CLIPBOARD_RELEASE: u32 = 9;
+const VD_AGENT_FILE_XFER_START: u32 = 10;
+const VD_AGENT_FILE_XFER_STATUS: u32 = 11;
+const VD_AGENT_FILE_XFER_DATA: u32 = 12;
+const VD_AGENT_CLIENT_DISCONNECTED: u32 = 13;
 
 const VD_AGENT_CLIPBOARD_NONE: u32 = 0;
 pub const VD_AGENT_CLIPBOARD_UTF8_TEXT: u32 = 1;
+pub const VD_AGENT_FILE_XFER_STATUS_CAN_SEND_DATA: u32 = 0;
+pub const VD_AGENT_FILE_XFER_STATUS_CANCELLED: u32 = 1;
+pub const VD_AGENT_FILE_XFER_STATUS_ERROR: u32 = 2;
+pub const VD_AGENT_FILE_XFER_STATUS_SUCCESS: u32 = 3;
+const VDI_CHUNK_MAX_DATA: usize = 1024;
 
 const VD_AGENT_CAP_CLIPBOARD_BY_DEMAND: usize = 5;
 const VD_AGENT_CAP_CLIPBOARD_SELECTION: usize = 6;
@@ -53,6 +62,19 @@ pub enum TransportEvent {
     HostRelease {
         selection: ClipboardSelection,
     },
+    HostFileXferStart {
+        id: u32,
+        metadata: Vec<u8>,
+    },
+    HostFileXferData {
+        id: u32,
+        data: Vec<u8>,
+    },
+    HostFileXferStatus {
+        id: u32,
+        result: u32,
+    },
+    HostClientDisconnected,
     Disconnected(String),
 }
 
@@ -243,6 +265,15 @@ impl SpiceTransport {
         Ok(true)
     }
 
+    pub fn send_file_xfer_status(&self, id: u32, result: u32) -> Result<()> {
+        let mut payload = Vec::with_capacity(8);
+        payload.extend_from_slice(&id.to_le_bytes());
+        payload.extend_from_slice(&result.to_le_bytes());
+        self.send_message(VD_AGENT_FILE_XFER_STATUS, &payload)?;
+        info!("sent guest -> host file transfer STATUS id={id} result={result}");
+        Ok(())
+    }
+
     fn send_capabilities(&self, request: bool) -> Result<()> {
         let mut caps = 0u32;
         set_capability(&mut caps, VD_AGENT_CAP_CLIPBOARD_BY_DEMAND);
@@ -291,9 +322,13 @@ fn reader_loop(
     sender: Sender<TransportEvent>,
 ) -> Result<()> {
     info!("listening for SPICE messages on {}", path.display());
+    let mut assembler = MessageAssembler::default();
 
     loop {
-        let (port, message_type, data) = read_one_message(&mut reader)?;
+        let (port, chunk) = read_one_chunk(&mut reader)?;
+        let Some((port, message_type, data)) = assembler.push_chunk(port, &chunk)? else {
+            continue;
+        };
         trace!(
             "received SPICE frame port={port} type={message_type} size={}",
             data.len()
@@ -409,6 +444,29 @@ fn reader_loop(
                     .send(TransportEvent::HostRelease { selection })
                     .context("failed to send HostRelease event")?;
             }
+            VD_AGENT_FILE_XFER_START => {
+                let (id, metadata) = parse_file_xfer_start(&data)?;
+                sender
+                    .send(TransportEvent::HostFileXferStart { id, metadata })
+                    .context("failed to send HostFileXferStart event")?;
+            }
+            VD_AGENT_FILE_XFER_DATA => {
+                let (id, payload) = parse_file_xfer_data(&data)?;
+                sender
+                    .send(TransportEvent::HostFileXferData { id, data: payload })
+                    .context("failed to send HostFileXferData event")?;
+            }
+            VD_AGENT_FILE_XFER_STATUS => {
+                let (id, result) = parse_file_xfer_status(&data)?;
+                sender
+                    .send(TransportEvent::HostFileXferStatus { id, result })
+                    .context("failed to send HostFileXferStatus event")?;
+            }
+            VD_AGENT_CLIENT_DISCONNECTED => {
+                sender
+                    .send(TransportEvent::HostClientDisconnected)
+                    .context("failed to send HostClientDisconnected event")?;
+            }
             other => {
                 trace!("ignoring unsupported SPICE message type {other}");
             }
@@ -416,7 +474,7 @@ fn reader_loop(
     }
 }
 
-fn read_one_message<R: Read>(reader: &mut R) -> Result<(u32, u32, Vec<u8>)> {
+fn read_one_chunk<R: Read>(reader: &mut R) -> Result<(u32, Vec<u8>)> {
     let mut chunk_header = [0u8; 8];
     reader
         .read_exact(&mut chunk_header)
@@ -424,14 +482,25 @@ fn read_one_message<R: Read>(reader: &mut R) -> Result<(u32, u32, Vec<u8>)> {
 
     let port = le_u32(&chunk_header[0..4]);
     let chunk_size = le_u32(&chunk_header[4..8]) as usize;
-    if chunk_size < 20 {
-        bail!("invalid SPICE message chunk size {chunk_size}");
+    if chunk_size == 0 {
+        bail!("invalid SPICE message chunk size 0");
     }
 
-    let mut message = vec![0u8; chunk_size];
+    let mut chunk = vec![0u8; chunk_size];
     reader
-        .read_exact(&mut message)
-        .context("failed to read SPICE message body")?;
+        .read_exact(&mut chunk)
+        .context("failed to read SPICE message chunk body")?;
+
+    Ok((port, chunk))
+}
+
+fn decode_message(port: u32, message: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
+    if message.len() < 20 {
+        bail!(
+            "incomplete SPICE agent message header: {} bytes",
+            message.len()
+        );
+    }
 
     let protocol = le_u32(&message[0..4]);
     if protocol != VD_AGENT_PROTOCOL {
@@ -451,6 +520,56 @@ fn read_one_message<R: Read>(reader: &mut R) -> Result<(u32, u32, Vec<u8>)> {
     Ok((port, message_type, payload))
 }
 
+#[derive(Default)]
+struct MessageAssembler {
+    current_port: Option<u32>,
+    buffer: Vec<u8>,
+    expected_len: Option<usize>,
+}
+
+impl MessageAssembler {
+    fn push_chunk(&mut self, port: u32, chunk: &[u8]) -> Result<Option<(u32, u32, Vec<u8>)>> {
+        if self.buffer.is_empty() {
+            if chunk.len() < 20 {
+                bail!(
+                    "initial SPICE agent chunk is too short for a header: {} bytes",
+                    chunk.len()
+                );
+            }
+
+            let payload_size = le_u32(&chunk[16..20]) as usize;
+            let expected_len = 20 + payload_size;
+            self.current_port = Some(port);
+            self.expected_len = Some(expected_len);
+            self.buffer.reserve(expected_len);
+        } else if self.current_port != Some(port) {
+            bail!(
+                "SPICE message continuation changed ports: {:?} -> {port}",
+                self.current_port
+            );
+        }
+
+        self.buffer.extend_from_slice(chunk);
+        let expected_len = self.expected_len.unwrap_or_default();
+        if self.buffer.len() < expected_len {
+            return Ok(None);
+        }
+
+        if self.buffer.len() > expected_len {
+            bail!(
+                "SPICE message assembly exceeded declared size: {} > {}",
+                self.buffer.len(),
+                expected_len
+            );
+        }
+
+        let port = self.current_port.take().unwrap_or(port);
+        let message = std::mem::take(&mut self.buffer);
+        self.expected_len = None;
+        decode_message(port, &message).map(Some)
+    }
+}
+
 fn encode_message_frame(message_type: u32, payload: &[u8]) -> Vec<u8> {
     let mut message = Vec::with_capacity(20 + payload.len());
     message.extend_from_slice(&VD_AGENT_PROTOCOL.to_le_bytes());
@@ -459,10 +578,15 @@ fn encode_message_frame(message_type: u32, payload: &[u8]) -> Vec<u8> {
     message.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     message.extend_from_slice(payload);
 
-    let mut frame = Vec::with_capacity(8 + message.len());
-    frame.extend_from_slice(&VDP_CLIENT_PORT.to_le_bytes());
-    frame.extend_from_slice(&(message.len() as u32).to_le_bytes());
-    frame.extend_from_slice(&message);
+    let mut frame = Vec::with_capacity(8 + message.len() + (message.len() / VDI_CHUNK_MAX_DATA));
+    let mut offset = 0usize;
+    while offset < message.len() {
+        let chunk_len = (message.len() - offset).min(VDI_CHUNK_MAX_DATA);
+        frame.extend_from_slice(&VDP_CLIENT_PORT.to_le_bytes());
+        frame.extend_from_slice(&(chunk_len as u32).to_le_bytes());
+        frame.extend_from_slice(&message[offset..offset + chunk_len]);
+        offset += chunk_len;
+    }
     frame
 }
 
@@ -592,6 +716,53 @@ fn parse_clipboard_release(state: &Arc<Mutex<TransportState>>, data: &[u8]) -> R
     Ok(selection)
 }
 
+fn parse_file_xfer_start(data: &[u8]) -> Result<(u32, Vec<u8>)> {
+    if data.len() < 5 {
+        bail!("file transfer START is too short");
+    }
+
+    let id = le_u32(&data[0..4]);
+    let metadata = data[4..].to_vec();
+    debug!(
+        "received host -> guest file transfer START id={id} metadata={} bytes",
+        metadata.len()
+    );
+    Ok((id, metadata))
+}
+
+fn parse_file_xfer_data(data: &[u8]) -> Result<(u32, Vec<u8>)> {
+    if data.len() < 12 {
+        bail!("file transfer DATA is too short");
+    }
+
+    let id = le_u32(&data[0..4]);
+    let declared_size = le_u64(&data[4..12]) as usize;
+    let payload = data[12..].to_vec();
+    if payload.len() != declared_size {
+        bail!(
+            "file transfer DATA size mismatch for id {id}: header says {declared_size}, payload has {}",
+            payload.len()
+        );
+    }
+
+    debug!(
+        "received host -> guest file transfer DATA id={id} bytes={}",
+        payload.len()
+    );
+    Ok((id, payload))
+}
+
+fn parse_file_xfer_status(data: &[u8]) -> Result<(u32, u32)> {
+    if data.len() < 8 {
+        bail!("file transfer STATUS is too short");
+    }
+
+    let id = le_u32(&data[0..4]);
+    let result = le_u32(&data[4..8]);
+    debug!("received host -> guest file transfer STATUS id={id} result={result}");
+    Ok((id, result))
+}
+
 fn selection_prefix(selection: ClipboardSelection) -> [u8; 4] {
     [selection.spice_id(), 0, 0, 0]
 }
@@ -610,6 +781,10 @@ fn has_capability(caps: &[u32], cap: usize) -> bool {
 
 fn le_u32(bytes: &[u8]) -> u32 {
     u32::from_le_bytes(bytes[0..4].try_into().expect("slice length checked"))
+}
+
+fn le_u64(bytes: &[u8]) -> u64 {
+    u64::from_le_bytes(bytes[0..8].try_into().expect("slice length checked"))
 }
 
 #[cfg(test)]
@@ -636,12 +811,41 @@ mod tests {
         let payload = b"hello clipboard";
         let frame = encode_message_frame(VD_AGENT_CLIPBOARD, payload);
         let mut cursor = Cursor::new(frame);
+        let mut assembler = MessageAssembler::default();
 
-        let (port, message_type, decoded_payload) =
-            read_one_message(&mut cursor).expect("frame should decode");
+        let mut decoded = None;
+        while (cursor.position() as usize) < cursor.get_ref().len() {
+            let (port, chunk) = read_one_chunk(&mut cursor).expect("chunk should decode");
+            decoded = assembler
+                .push_chunk(port, &chunk)
+                .expect("message assembly should succeed");
+        }
+
+        let (port, message_type, decoded_payload) = decoded.expect("frame should decode");
 
         assert_eq!(port, VDP_CLIENT_PORT);
         assert_eq!(message_type, VD_AGENT_CLIPBOARD);
+        assert_eq!(decoded_payload, payload);
+    }
+
+    #[test]
+    fn large_frame_roundtrips_across_multiple_chunks() {
+        let payload = vec![0x5a; 4096];
+        let frame = encode_message_frame(VD_AGENT_FILE_XFER_DATA, &payload);
+        let mut cursor = Cursor::new(frame);
+        let mut assembler = MessageAssembler::default();
+        let mut decoded = None;
+
+        while (cursor.position() as usize) < cursor.get_ref().len() {
+            let (port, chunk) = read_one_chunk(&mut cursor).expect("chunk should decode");
+            decoded = assembler
+                .push_chunk(port, &chunk)
+                .expect("message assembly should succeed");
+        }
+
+        let (port, message_type, decoded_payload) = decoded.expect("message should decode");
+        assert_eq!(port, VDP_CLIENT_PORT);
+        assert_eq!(message_type, VD_AGENT_FILE_XFER_DATA);
         assert_eq!(decoded_payload, payload);
     }
 
@@ -703,5 +907,26 @@ mod tests {
         assert_eq!(serial, Some(3));
         assert!(types.is_empty());
         assert_eq!(state.lock().unwrap().serial_counter, 10);
+    }
+
+    #[test]
+    fn parse_file_xfer_start_extracts_id_and_metadata() {
+        let (id, metadata) =
+            parse_file_xfer_start(&[7, 0, 0, 0, b'a', b'b']).expect("start should parse");
+
+        assert_eq!(id, 7);
+        assert_eq!(metadata, b"ab");
+    }
+
+    #[test]
+    fn parse_file_xfer_data_validates_declared_size() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&9u32.to_le_bytes());
+        payload.extend_from_slice(&3u64.to_le_bytes());
+        payload.extend_from_slice(b"hey");
+
+        let (id, data) = parse_file_xfer_data(&payload).expect("data should parse");
+        assert_eq!(id, 9);
+        assert_eq!(data, b"hey");
     }
 }

@@ -1,3 +1,4 @@
+mod file_transfer;
 mod selection;
 mod spice;
 mod wayland;
@@ -10,6 +11,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
+use file_transfer::FileTransferManager;
 use selection::ClipboardSelection;
 use spice::{PeerCapabilities, SpiceTransport, TransportEvent, VD_AGENT_CLIPBOARD_UTF8_TEXT};
 use tracing::{debug, info, warn};
@@ -35,6 +37,16 @@ struct Cli {
 
     #[arg(long, env = "PAPRIKA_VDAGENT_SEAT")]
     seat: Option<String>,
+
+    #[arg(long, env = "PAPRIKA_VDAGENT_FILE_DIR")]
+    file_dir: Option<PathBuf>,
+
+    #[arg(
+        long,
+        env = "PAPRIKA_VDAGENT_MAX_ACTIVE_FILE_TRANSFERS",
+        default_value_t = 8
+    )]
+    max_active_file_transfers: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +114,8 @@ fn run(cli: Cli) -> Result<()> {
         .map(|seat| SeatSelector::Specific(seat.clone()))
         .unwrap_or(SeatSelector::Unspecified);
     let clipboard = WaylandClipboard::new(cli.max_text_bytes, seat.clone())?;
+    let mut file_transfers =
+        FileTransferManager::new(cli.file_dir.clone(), Some(cli.max_active_file_transfers))?;
 
     if !clipboard.selection_supported(ClipboardSelection::Primary) {
         info!(
@@ -148,6 +162,15 @@ fn run(cli: Cli) -> Result<()> {
     }
 
     let poll_interval = Duration::from_millis(cli.poll_ms);
+    if let Some(save_dir) = file_transfers.save_dir() {
+        info!(
+            "file transfer support is enabled (save_dir={}, max_active={})",
+            save_dir.display(),
+            file_transfers.max_active_transfers()
+        );
+    } else {
+        info!("file transfer support is disabled");
+    }
     info!(
         "starting bridge loop on {} (seat={}, poll fallback={} ms)",
         cli.virtio_port.display(),
@@ -164,6 +187,7 @@ fn run(cli: Cli) -> Result<()> {
                 &transport,
                 &clipboard,
                 &mut state,
+                &mut file_transfers,
                 event,
                 &mut watcher_active,
             )?;
@@ -173,6 +197,7 @@ fn run(cli: Cli) -> Result<()> {
                     &transport,
                     &clipboard,
                     &mut state,
+                    &mut file_transfers,
                     event,
                     &mut watcher_active,
                 )?;
@@ -184,6 +209,7 @@ fn run(cli: Cli) -> Result<()> {
                         &transport,
                         &clipboard,
                         &mut state,
+                        &mut file_transfers,
                         event,
                         &mut watcher_active,
                     )?;
@@ -192,6 +218,7 @@ fn run(cli: Cli) -> Result<()> {
                             &transport,
                             &clipboard,
                             &mut state,
+                            &mut file_transfers,
                             event,
                             &mut watcher_active,
                         )?;
@@ -260,6 +287,7 @@ fn handle_bridge_event(
     transport: &SpiceTransport,
     clipboard: &WaylandClipboard,
     state: &mut BridgeState,
+    file_transfers: &mut FileTransferManager,
     event: BridgeEvent,
     watcher_active: &mut bool,
 ) -> Result<()> {
@@ -411,7 +439,21 @@ fn handle_bridge_event(
                     let _ = released_text;
                 }
             }
+            TransportEvent::HostFileXferStart { id, metadata } => {
+                file_transfers.handle_start(transport, id, &metadata)?;
+            }
+            TransportEvent::HostFileXferData { id, data } => {
+                file_transfers.handle_data(transport, id, &data)?;
+            }
+            TransportEvent::HostFileXferStatus { id, result } => {
+                file_transfers.handle_host_status(id, result);
+            }
+            TransportEvent::HostClientDisconnected => {
+                info!("SPICE client disconnected, cancelling in-flight file transfers");
+                file_transfers.cancel_all("SPICE client disconnected");
+            }
             TransportEvent::Disconnected(message) => {
+                file_transfers.cancel_all("SPICE transport disconnected");
                 bail!("SPICE transport disconnected: {message}");
             }
         },

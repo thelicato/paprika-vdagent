@@ -1,6 +1,6 @@
 # Paprika vdagent
 
-`paprika-vdagent` is a standalone Wayland clipboard bridge for SPICE/QEMU Linux guests.
+`paprika-vdagent` is a standalone Wayland clipboard and file-transfer bridge for SPICE/QEMU Linux guests.
 
 It is designed for Wayland sessions where the traditional X11-focused `spice-vdagent` session agent is not enough, with Hyprland and wlroots compositors as the first target.
 
@@ -8,6 +8,7 @@ It is designed for Wayland sessions where the traditional X11-focused `spice-vda
 
 - syncs the regular clipboard between host and guest
 - syncs primary selection when both sides support it
+- receives client-to-guest file transfers into the guest
 - works over the standard SPICE/QEMU virtio serial channel
 - does not require host-side changes
 - does not rely on X11 or XWayland clipboard mirroring
@@ -16,7 +17,9 @@ It is designed for Wayland sessions where the traditional X11-focused `spice-vda
 
 `paprika-vdagent` runs inside the guest Wayland session and directly owns `/dev/virtio-ports/com.redhat.spice.0`.
 
-It speaks the SPICE guest clipboard protocol itself and bridges that to the Wayland clipboard using `ext-data-control` or `wlr-data-control`. In practice, this means it replaces the clipboard part of the usual `spice-vdagentd` plus `spice-vdagent` guest path.
+It speaks the SPICE guest clipboard and file-transfer protocol itself. Clipboard sync is bridged to Wayland using `ext-data-control` or `wlr-data-control`, and incoming files are saved into `~/Downloads` by default or a custom directory set with `--file-dir`.
+
+In practice, this means it replaces the clipboard and file-transfer part of the usual `spice-vdagentd` plus `spice-vdagent` guest path.
 
 More background is in [docs/architecture.md](./docs/architecture.md).
 
@@ -25,6 +28,7 @@ More background is in [docs/architecture.md](./docs/architecture.md).
 - a SPICE/QEMU Linux guest with `/dev/virtio-ports/com.redhat.spice.0`
 - a Wayland compositor exposing `ext-data-control` or `wlr-data-control`
 - a Wayland session where this process can access the compositor and the virtio port
+- a writable guest download directory such as `~/Downloads`, or a custom path passed with `--file-dir`
 - the stock `spice-vdagentd` and `spice-vdagent` processes stopped, so they do not compete for the same virtio channel
 
 To stop the stock agents:
@@ -77,6 +81,12 @@ Run it from the guest Wayland session:
 
 ```bash
 RUST_LOG=paprika_vdagent=debug ./target/release/paprika-vdagent
+```
+
+If you want incoming files somewhere else:
+
+```bash
+RUST_LOG=paprika_vdagent=debug ./target/release/paprika-vdagent --file-dir /path/to/save/files
 ```
 
 If needed, you can pin a specific seat:

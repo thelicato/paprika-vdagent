@@ -4,7 +4,7 @@
 
 For v1, `paprika-vdagent` should **directly own** `/dev/virtio-ports/com.redhat.spice.0`.
 
-That means it replaces the clipboard-related guest-side SPICE agent path instead of coexisting with `spice-vdagentd`.
+That means it replaces the clipboard and file-transfer guest-side SPICE agent path instead of coexisting with `spice-vdagentd`.
 
 ## Why `spice-vdagentd` is not a clean dependency
 
@@ -36,7 +36,7 @@ Technically, a custom Wayland agent could talk to `/run/spice-vdagentd/spice-vda
 ## Compatibility classification
 
 - `spice-vdagent`: incompatible with this tool's goals and not required
-- `spice-vdagentd`: not a clean reusable dependency for Wayland clipboard v1
+- `spice-vdagentd`: not a clean reusable dependency for Wayland clipboard / file-transfer v1
 - Direct virtio ownership: the recommended architecture for the standalone tool
 
 ## Clipboard ownership flow
@@ -56,6 +56,18 @@ Technically, a custom Wayland agent could talk to `/run/spice-vdagentd/spice-vda
 3. After `VD_AGENT_CLIPBOARD` arrives, the bridge writes that text into the matching Wayland selection using data-control.
 4. The bridge suppresses the immediate self-induced clipboard echo so the injected host clipboard is not reflected straight back to the host as a new guest grab.
 5. If the host sends `VD_AGENT_CLIPBOARD_RELEASE` and the bridge is still serving the host-owned text locally, the bridge clears the matching Wayland selection.
+
+## File transfer flow
+
+### Host client -> guest
+
+1. The SPICE client sends `VD_AGENT_FILE_XFER_START` with keyfile-style metadata describing the file name and size.
+2. The bridge creates a temporary file in the guest save directory, which defaults to `~/Downloads` and can be overridden with `--file-dir`.
+3. If that succeeds, the bridge replies with `VD_AGENT_FILE_XFER_STATUS_CAN_SEND_DATA`.
+4. The host streams file contents with `VD_AGENT_FILE_XFER_DATA`.
+5. The bridge writes each chunk to disk and tracks the declared size.
+6. When the expected byte count has been received, the bridge renames the temporary file into place and replies with `VD_AGENT_FILE_XFER_STATUS_SUCCESS`.
+7. If the host cancels the transfer or a local write fails, the bridge removes the temporary file and reports an error or cancellation back to the host.
 
 ## Wayland backend
 
@@ -79,6 +91,9 @@ Regular clipboard and primary selection are both supported in the current implem
 - `VD_AGENT_CLIPBOARD_REQUEST`
 - `VD_AGENT_CLIPBOARD`
 - `VD_AGENT_CLIPBOARD_RELEASE`
+- `VD_AGENT_FILE_XFER_START`
+- `VD_AGENT_FILE_XFER_STATUS`
+- `VD_AGENT_FILE_XFER_DATA`
 
 Capabilities used:
 
@@ -95,10 +110,11 @@ Currently implemented selections:
 ## Known limitations
 
 - Direct-virtio mode means this prototype must not run at the same time as `spice-vdagentd`
-- Clipboard only
 - Text only
 - Secondary selection is not implemented
 - Primary selection depends on compositor support and host viewer/client support
+- File transfer currently covers the standard client-to-guest path only
+- Detailed SPICE file-transfer error payloads are not implemented
 - Event-driven watch support currently depends on `ext-data-control` or `wlr-data-control`
 - Environments without both `ext-data-control` and `wlr-data-control` fall back to polling
 
