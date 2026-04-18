@@ -1,4 +1,4 @@
-# Paprika vdagent
+# Paprika agent
 
 `paprika-vdagent` is a standalone Wayland clipboard and file-transfer bridge for SPICE/QEMU Linux guests.
 
@@ -36,6 +36,32 @@ To stop the stock agents:
 ```bash
 sudo systemctl stop spice-vdagentd.service spice-vdagentd.socket
 pkill -x spice-vdagent || true
+```
+
+## 📝 Usage
+
+```
+Standalone Wayland SPICE clipboard and file-transfer bridge for Linux guests
+
+Usage: paprika-vdagent [OPTIONS]
+
+Options:
+      --virtio-port <VIRTIO_PORT>
+          [env: PAPRIKA_VDAGENT_PORT=] [default: /dev/virtio-ports/com.redhat.spice.0]
+      --poll-ms <POLL_MS>
+          [env: PAPRIKA_VDAGENT_POLL_MS=] [default: 250]
+      --max-text-bytes <MAX_TEXT_BYTES>
+          [env: PAPRIKA_VDAGENT_MAX_TEXT_BYTES=] [default: 1048576]
+      --seat <SEAT>
+          [env: PAPRIKA_VDAGENT_SEAT=]
+      --file-dir <FILE_DIR>
+          [env: PAPRIKA_VDAGENT_FILE_DIR=]
+      --max-active-file-transfers <MAX_ACTIVE_FILE_TRANSFERS>
+          [env: PAPRIKA_VDAGENT_MAX_ACTIVE_FILE_TRANSFERS=] [default: 8]
+  -h, --help
+          Print help
+  -V, --version
+          Print version
 ```
 
 ## 📦 Install
