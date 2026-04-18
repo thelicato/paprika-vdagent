@@ -1,3 +1,4 @@
+use std::fmt;
 use std::io::Read;
 
 use anyhow::{Context, Result, bail};
@@ -11,13 +12,48 @@ use wl_clipboard_rs::paste::{
     Seat as PasteSeat, get_contents,
 };
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SeatSelector {
+    Unspecified,
+    Specific(String),
+}
+
+impl SeatSelector {
+    fn paste_seat(&self) -> PasteSeat<'_> {
+        match self {
+            Self::Unspecified => PasteSeat::Unspecified,
+            Self::Specific(name) => PasteSeat::Specific(name.as_str()),
+        }
+    }
+
+    fn copy_seat(&self) -> CopySeat {
+        match self {
+            Self::Unspecified => CopySeat::All,
+            Self::Specific(name) => CopySeat::Specific(name.clone()),
+        }
+    }
+}
+
+impl fmt::Display for SeatSelector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unspecified => write!(f, "unspecified"),
+            Self::Specific(name) => write!(f, "{name}"),
+        }
+    }
+}
+
 pub struct WaylandClipboard {
     max_text_bytes: usize,
+    seat: SeatSelector,
 }
 
 impl WaylandClipboard {
-    pub fn new(max_text_bytes: usize) -> Result<Self> {
-        let clipboard = Self { max_text_bytes };
+    pub fn new(max_text_bytes: usize, seat: SeatSelector) -> Result<Self> {
+        let clipboard = Self {
+            max_text_bytes,
+            seat,
+        };
         clipboard.probe()?;
         Ok(clipboard)
     }
@@ -25,7 +61,7 @@ impl WaylandClipboard {
     pub fn read_text(&self) -> Result<Option<String>> {
         match get_contents(
             PasteClipboardType::Regular,
-            PasteSeat::Unspecified,
+            self.seat.paste_seat(),
             PasteMimeType::Text,
         ) {
             Ok((pipe, _mime)) => {
@@ -66,7 +102,9 @@ impl WaylandClipboard {
             );
         }
 
-        let options = CopyOptions::new();
+        let mut options = CopyOptions::new();
+        options.clipboard(CopyClipboardType::Regular);
+        options.seat(self.seat.copy_seat());
         copy(
             options,
             CopySource::Bytes(text.as_bytes().to_vec().into()),
@@ -76,8 +114,12 @@ impl WaylandClipboard {
     }
 
     pub fn clear(&self) -> Result<()> {
-        copy_clear(CopyClipboardType::Regular, CopySeat::All)
+        copy_clear(CopyClipboardType::Regular, self.seat.copy_seat())
             .context("failed to clear Wayland clipboard")
+    }
+
+    pub fn seat(&self) -> &SeatSelector {
+        &self.seat
     }
 
     fn probe(&self) -> Result<()> {

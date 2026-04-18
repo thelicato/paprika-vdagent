@@ -1,17 +1,19 @@
 mod spice;
 mod wayland;
+mod wayland_watch;
 
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use spice::{PeerCapabilities, SpiceTransport, TransportEvent, VD_AGENT_CLIPBOARD_UTF8_TEXT};
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
-use wayland::WaylandClipboard;
+use wayland::{SeatSelector, WaylandClipboard};
+use wayland_watch::{WatchEvent, spawn_selection_watcher};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
@@ -28,6 +30,9 @@ struct Cli {
 
     #[arg(long, env = "PAPRIKA_VDAGENT_MAX_TEXT_BYTES", default_value_t = 1024 * 1024)]
     max_text_bytes: usize,
+
+    #[arg(long, env = "PAPRIKA_VDAGENT_SEAT")]
+    seat: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +51,12 @@ struct BridgeState {
     suppress_text: Option<String>,
     suppress_empty: bool,
     peer_caps: Option<PeerCapabilities>,
+}
+
+enum BridgeEvent {
+    Transport(TransportEvent),
+    WaylandSelectionChanged,
+    WaylandWatcherDisconnected(String),
 }
 
 impl Default for BridgeState {
@@ -69,11 +80,37 @@ fn main() -> Result<()> {
 }
 
 fn run(cli: Cli) -> Result<()> {
-    let clipboard = WaylandClipboard::new(cli.max_text_bytes)?;
-    let (tx, rx) = mpsc::channel();
-    let transport = SpiceTransport::connect(&cli.virtio_port, tx, cli.max_text_bytes)?;
+    let seat = cli
+        .seat
+        .as_ref()
+        .map(|seat| SeatSelector::Specific(seat.clone()))
+        .unwrap_or(SeatSelector::Unspecified);
+    let clipboard = WaylandClipboard::new(cli.max_text_bytes, seat.clone())?;
+
+    let (bridge_tx, bridge_rx) = mpsc::channel();
+
+    let (transport_tx, transport_rx) = mpsc::channel();
+    let transport = SpiceTransport::connect(&cli.virtio_port, transport_tx, cli.max_text_bytes)?;
+    spawn_transport_forwarder(transport_rx, bridge_tx.clone())?;
 
     let mut state = BridgeState::default();
+    let mut watcher_active = false;
+
+    match spawn_wayland_forwarder(seat, bridge_tx.clone()) {
+        Ok(()) => {
+            watcher_active = true;
+            info!(
+                "using event-driven Wayland clipboard watching on seat {}",
+                clipboard.seat()
+            );
+        }
+        Err(err) => {
+            warn!(
+                "failed to start event-driven Wayland watcher: {err:#}; falling back to polling every {} ms",
+                cli.poll_ms
+            );
+        }
+    }
 
     if let Some(text) = clipboard.read_text()? {
         info!(
@@ -87,27 +124,118 @@ fn run(cli: Cli) -> Result<()> {
 
     let poll_interval = Duration::from_millis(cli.poll_ms);
     info!(
-        "starting bridge loop with poll interval {} ms on {}",
-        cli.poll_ms,
-        cli.virtio_port.display()
+        "starting bridge loop on {} (seat={}, poll fallback={} ms)",
+        cli.virtio_port.display(),
+        clipboard.seat(),
+        cli.poll_ms
     );
 
     loop {
-        drain_transport_events(&transport, &clipboard, &rx, &mut state)?;
-        let snapshot = clipboard.read_text()?;
-        handle_wayland_snapshot(&transport, &mut state, snapshot)?;
-        thread::sleep(poll_interval);
+        if watcher_active {
+            let event = bridge_rx
+                .recv()
+                .context("all bridge event senders disconnected unexpectedly")?;
+            handle_bridge_event(
+                &transport,
+                &clipboard,
+                &mut state,
+                event,
+                &mut watcher_active,
+            )?;
+
+            while let Ok(event) = bridge_rx.try_recv() {
+                handle_bridge_event(
+                    &transport,
+                    &clipboard,
+                    &mut state,
+                    event,
+                    &mut watcher_active,
+                )?;
+            }
+        } else {
+            match bridge_rx.recv_timeout(poll_interval) {
+                Ok(event) => {
+                    handle_bridge_event(
+                        &transport,
+                        &clipboard,
+                        &mut state,
+                        event,
+                        &mut watcher_active,
+                    )?;
+                    while let Ok(event) = bridge_rx.try_recv() {
+                        handle_bridge_event(
+                            &transport,
+                            &clipboard,
+                            &mut state,
+                            event,
+                            &mut watcher_active,
+                        )?;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    bail!("all bridge event senders disconnected unexpectedly")
+                }
+            }
+
+            let snapshot = clipboard.read_text()?;
+            handle_wayland_snapshot(&transport, &mut state, snapshot)?;
+        }
     }
 }
 
-fn drain_transport_events(
+fn spawn_transport_forwarder(
+    rx: Receiver<TransportEvent>,
+    tx: mpsc::Sender<BridgeEvent>,
+) -> Result<()> {
+    thread::Builder::new()
+        .name("paprika-transport-forward".to_string())
+        .spawn(move || {
+            while let Ok(event) = rx.recv() {
+                if tx.send(BridgeEvent::Transport(event)).is_err() {
+                    break;
+                }
+            }
+        })
+        .context("failed to spawn transport event forwarder")?;
+
+    Ok(())
+}
+
+fn spawn_wayland_forwarder(seat: SeatSelector, tx: mpsc::Sender<BridgeEvent>) -> Result<()> {
+    let (watch_tx, watch_rx) = mpsc::channel();
+    spawn_selection_watcher(seat, watch_tx)?;
+
+    thread::Builder::new()
+        .name("paprika-watch-forward".to_string())
+        .spawn(move || {
+            while let Ok(event) = watch_rx.recv() {
+                let bridge_event = match event {
+                    WatchEvent::SelectionChanged => BridgeEvent::WaylandSelectionChanged,
+                    WatchEvent::Disconnected(message) => {
+                        BridgeEvent::WaylandWatcherDisconnected(message)
+                    }
+                };
+
+                if tx.send(bridge_event).is_err() {
+                    break;
+                }
+            }
+        })
+        .context("failed to spawn Wayland watcher forwarder")?;
+
+    Ok(())
+}
+
+fn handle_bridge_event(
     transport: &SpiceTransport,
     clipboard: &WaylandClipboard,
-    rx: &Receiver<TransportEvent>,
     state: &mut BridgeState,
+    event: BridgeEvent,
+    watcher_active: &mut bool,
 ) -> Result<()> {
-    while let Ok(event) = rx.try_recv() {
-        match event {
+    match event {
+        BridgeEvent::Transport(event) => match event {
             TransportEvent::PeerCapabilities(peer) => {
                 info!(
                     "peer capabilities announced: clipboard_by_demand={} selection={} grab_serial={}",
@@ -128,7 +256,7 @@ fn drain_transport_events(
             TransportEvent::HostGrab { types, serial } => {
                 if types.is_empty() {
                     debug!("discarded stale or empty host clipboard GRAB");
-                    continue;
+                    return Ok(());
                 }
 
                 info!("host claimed clipboard ownership (serial={serial:?}, types={types:?})");
@@ -140,7 +268,7 @@ fn drain_transport_events(
                         state.last_wayland_text = None;
                         state.host_cache = None;
                     }
-                    continue;
+                    return Ok(());
                 }
 
                 transport.send_clipboard_request_text()?;
@@ -152,7 +280,7 @@ fn drain_transport_events(
                         "host requested unsupported clipboard type {data_type}, sending empty data"
                     );
                     transport.send_empty_clipboard_data()?;
-                    continue;
+                    return Ok(());
                 }
 
                 if let Some(text) = state
@@ -169,7 +297,7 @@ fn drain_transport_events(
             TransportEvent::HostData { data_type, data } => {
                 if data_type != VD_AGENT_CLIPBOARD_UTF8_TEXT {
                     warn!("host sent unsupported clipboard data type {data_type}, ignoring");
-                    continue;
+                    return Ok(());
                 }
 
                 let text = String::from_utf8(data)
@@ -208,6 +336,14 @@ fn drain_transport_events(
             TransportEvent::Disconnected(message) => {
                 bail!("SPICE transport disconnected: {message}");
             }
+        },
+        BridgeEvent::WaylandSelectionChanged => {
+            let snapshot = clipboard.read_text()?;
+            handle_wayland_snapshot(transport, state, snapshot)?;
+        }
+        BridgeEvent::WaylandWatcherDisconnected(message) => {
+            warn!("{message}; switching back to polling mode");
+            *watcher_active = false;
         }
     }
 
