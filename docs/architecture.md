@@ -101,7 +101,6 @@ Currently implemented selections:
 - Primary selection depends on compositor support and host viewer/client support
 - Event-driven watch support currently depends on `ext-data-control` or `wlr-data-control`
 - Environments without both `ext-data-control` and `wlr-data-control` fall back to polling
-- No image, HTML, URI-list, or file-transfer support yet
 
 ## References
 

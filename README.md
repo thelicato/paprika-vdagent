@@ -85,16 +85,6 @@ If needed, you can pin a specific seat:
 RUST_LOG=paprika_vdagent=debug ./target/release/paprika-vdagent --seat seat0
 ```
 
-## ⚠️ Current Limitations
-
-- clipboard sync only
-- text only
-- first target is Hyprland and wlroots-based compositors
-- primary selection depends on compositor support and host viewer support
-- secondary selection is not implemented
-- image, HTML, URI list, and file transfer are not implemented
-- if event-driven watching is unavailable, the bridge falls back to polling
-
 ## 🪪 License
 
-`spice-vdagent` is released under the [GPL-3.0 LICENSE](./LICENSE)
+`paprika-vdagent` is released under the [GPL-3.0 LICENSE](./LICENSE)
