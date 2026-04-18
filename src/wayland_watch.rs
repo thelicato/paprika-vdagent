@@ -8,6 +8,11 @@ use wayland_client::globals::{GlobalListContents, registry_queue_init};
 use wayland_client::protocol::wl_registry::WlRegistry;
 use wayland_client::protocol::wl_seat::{self, WlSeat};
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, event_created_child};
+use wayland_protocols::ext::data_control::v1::client::ext_data_control_device_v1::{
+    self, ExtDataControlDeviceV1,
+};
+use wayland_protocols::ext::data_control::v1::client::ext_data_control_manager_v1::ExtDataControlManagerV1;
+use wayland_protocols::ext::data_control::v1::client::ext_data_control_offer_v1::ExtDataControlOfferV1;
 use wayland_protocols_wlr::data_control::v1::client::zwlr_data_control_device_v1::{
     self, ZwlrDataControlDeviceV1,
 };
@@ -20,6 +25,50 @@ use crate::wayland::SeatSelector;
 pub enum WatchEvent {
     SelectionChanged,
     Disconnected(String),
+}
+
+#[derive(Clone)]
+enum WatchManager {
+    Ext(ExtDataControlManagerV1),
+    Zwlr(ZwlrDataControlManagerV1),
+}
+
+impl WatchManager {
+    fn bind(globals: &wayland_client::globals::GlobalList, qh: &QueueHandle<WatchState>) -> Result<Self> {
+        if let Ok(manager) = globals.bind::<ExtDataControlManagerV1, _, _>(qh, 1..=1, ()) {
+            info!("using ext-data-control for event-driven clipboard watching");
+            return Ok(Self::Ext(manager));
+        }
+
+        if let Ok(manager) = globals.bind::<ZwlrDataControlManagerV1, _, _>(qh, 1..=1, ()) {
+            info!("using wlr-data-control for event-driven clipboard watching");
+            return Ok(Self::Zwlr(manager));
+        }
+
+        bail!("required Wayland protocol ext-data-control or wlr-data-control is not available")
+    }
+
+    fn get_data_device(&self, seat: &WlSeat, qh: &QueueHandle<WatchState>) -> WatchDevice {
+        match self {
+            Self::Ext(manager) => WatchDevice::Ext(manager.get_data_device(seat, qh, seat.clone())),
+            Self::Zwlr(manager) => WatchDevice::Zwlr(manager.get_data_device(seat, qh, seat.clone())),
+        }
+    }
+}
+
+#[derive(Clone)]
+enum WatchDevice {
+    Ext(ExtDataControlDeviceV1),
+    Zwlr(ZwlrDataControlDeviceV1),
+}
+
+impl WatchDevice {
+    fn destroy(&self) {
+        match self {
+            Self::Ext(device) => device.destroy(),
+            Self::Zwlr(device) => device.destroy(),
+        }
+    }
 }
 
 pub fn spawn_selection_watcher(seat: SeatSelector, sender: Sender<WatchEvent>) -> Result<()> {
@@ -69,9 +118,7 @@ fn initialize_watcher(
         .context("failed to initialize Wayland registry")?;
     let qh = queue.handle();
 
-    let manager: ZwlrDataControlManagerV1 = globals
-        .bind(&qh, 1..=1, ())
-        .map_err(|_| anyhow!("required Wayland protocol wlr-data-control v1 is not available"))?;
+    let manager = WatchManager::bind(&globals, &qh)?;
 
     let registry = globals.registry();
     let mut seats: HashMap<WlSeat, SeatState> = globals.contents().with_list(|globals| {
@@ -88,7 +135,7 @@ fn initialize_watcher(
 
     let keys: Vec<WlSeat> = seats.keys().cloned().collect();
     for key in &keys {
-        let device = manager.get_data_device(key, &qh, key.clone());
+        let device = manager.get_data_device(key, &qh);
         seats.get_mut(key).unwrap().set_device(Some(device));
     }
 
@@ -130,7 +177,7 @@ fn watch_loop(queue: &mut EventQueue<WatchState>, state: &mut WatchState) -> Res
 #[derive(Default)]
 struct SeatState {
     name: Option<String>,
-    device: Option<ZwlrDataControlDeviceV1>,
+    device: Option<WatchDevice>,
 }
 
 impl SeatState {
@@ -138,7 +185,7 @@ impl SeatState {
         self.name = Some(name);
     }
 
-    fn set_device(&mut self, device: Option<ZwlrDataControlDeviceV1>) {
+    fn set_device(&mut self, device: Option<WatchDevice>) {
         let old = self.device.take();
         self.device = device;
         if let Some(device) = old {
@@ -209,6 +256,18 @@ impl Dispatch<ZwlrDataControlManagerV1, ()> for WatchState {
     }
 }
 
+impl Dispatch<ExtDataControlManagerV1, ()> for WatchState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ExtDataControlManagerV1,
+        _event: <ExtDataControlManagerV1 as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
 impl Dispatch<ZwlrDataControlDeviceV1, WlSeat> for WatchState {
     fn event(
         state: &mut Self,
@@ -241,11 +300,55 @@ impl Dispatch<ZwlrDataControlDeviceV1, WlSeat> for WatchState {
     ]);
 }
 
+impl Dispatch<ExtDataControlDeviceV1, WlSeat> for WatchState {
+    fn event(
+        state: &mut Self,
+        _proxy: &ExtDataControlDeviceV1,
+        event: <ExtDataControlDeviceV1 as Proxy>::Event,
+        seat: &WlSeat,
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            ext_data_control_device_v1::Event::Selection { id } => {
+                if state.armed && state.should_notify(seat) {
+                    debug!("Wayland clipboard selection changed");
+                    let _ = id;
+                    let _ = state.sender.send(WatchEvent::SelectionChanged);
+                }
+            }
+            ext_data_control_device_v1::Event::Finished => {
+                warn!("Wayland data-control device was finished by the compositor");
+                if let Some(seat_state) = state.seats.get_mut(seat) {
+                    seat_state.set_device(None);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    event_created_child!(WatchState, ExtDataControlDeviceV1, [
+        ext_data_control_device_v1::EVT_DATA_OFFER_OPCODE => (ExtDataControlOfferV1, ())
+    ]);
+}
+
 impl Dispatch<ZwlrDataControlOfferV1, ()> for WatchState {
     fn event(
         _state: &mut Self,
         _proxy: &ZwlrDataControlOfferV1,
         _event: <ZwlrDataControlOfferV1 as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ExtDataControlOfferV1, ()> for WatchState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ExtDataControlOfferV1,
+        _event: <ExtDataControlOfferV1 as Proxy>::Event,
         _data: &(),
         _conn: &Connection,
         _qhandle: &QueueHandle<Self>,

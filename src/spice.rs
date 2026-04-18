@@ -258,17 +258,7 @@ impl SpiceTransport {
     }
 
     fn send_message(&self, message_type: u32, payload: &[u8]) -> Result<()> {
-        let mut message = Vec::with_capacity(20 + payload.len());
-        message.extend_from_slice(&VD_AGENT_PROTOCOL.to_le_bytes());
-        message.extend_from_slice(&message_type.to_le_bytes());
-        message.extend_from_slice(&0u64.to_le_bytes());
-        message.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        message.extend_from_slice(payload);
-
-        let mut frame = Vec::with_capacity(8 + message.len());
-        frame.extend_from_slice(&VDP_CLIENT_PORT.to_le_bytes());
-        frame.extend_from_slice(&(message.len() as u32).to_le_bytes());
-        frame.extend_from_slice(&message);
+        let frame = encode_message_frame(message_type, payload);
 
         let mut writer = self
             .writer
@@ -404,7 +394,7 @@ fn reader_loop(
     }
 }
 
-fn read_one_message(reader: &mut File) -> Result<(u32, u32, Vec<u8>)> {
+fn read_one_message<R: Read>(reader: &mut R) -> Result<(u32, u32, Vec<u8>)> {
     let mut chunk_header = [0u8; 8];
     reader
         .read_exact(&mut chunk_header)
@@ -437,6 +427,21 @@ fn read_one_message(reader: &mut File) -> Result<(u32, u32, Vec<u8>)> {
 
     let payload = message[20..20 + payload_size].to_vec();
     Ok((port, message_type, payload))
+}
+
+fn encode_message_frame(message_type: u32, payload: &[u8]) -> Vec<u8> {
+    let mut message = Vec::with_capacity(20 + payload.len());
+    message.extend_from_slice(&VD_AGENT_PROTOCOL.to_le_bytes());
+    message.extend_from_slice(&message_type.to_le_bytes());
+    message.extend_from_slice(&0u64.to_le_bytes());
+    message.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    message.extend_from_slice(payload);
+
+    let mut frame = Vec::with_capacity(8 + message.len());
+    frame.extend_from_slice(&VDP_CLIENT_PORT.to_le_bytes());
+    frame.extend_from_slice(&(message.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&message);
+    frame
 }
 
 fn parse_capabilities(data: &[u8]) -> Result<Vec<u32>> {
@@ -585,4 +590,79 @@ fn has_capability(caps: &[u32], cap: usize) -> bool {
 
 fn le_u32(bytes: &[u8]) -> u32 {
     u32::from_le_bytes(bytes[0..4].try_into().expect("slice length checked"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn state_with(selection: bool, serial: bool, serial_counter: u32) -> Arc<Mutex<TransportState>> {
+        Arc::new(Mutex::new(TransportState {
+            peer_caps: Vec::new(),
+            clipboard_by_demand: true,
+            clipboard_selection: selection,
+            clipboard_grab_serial: serial,
+            serial_counter,
+        }))
+    }
+
+    #[test]
+    fn encoded_frame_roundtrips_through_reader() {
+        let payload = b"hello clipboard";
+        let frame = encode_message_frame(VD_AGENT_CLIPBOARD, payload);
+        let mut cursor = Cursor::new(frame);
+
+        let (port, message_type, decoded_payload) =
+            read_one_message(&mut cursor).expect("frame should decode");
+
+        assert_eq!(port, VDP_CLIENT_PORT);
+        assert_eq!(message_type, VD_AGENT_CLIPBOARD);
+        assert_eq!(decoded_payload, payload);
+    }
+
+    #[test]
+    fn parse_capabilities_extracts_words_after_request_flag() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.extend_from_slice(&0x1234_5678u32.to_le_bytes());
+        payload.extend_from_slice(&0x9abc_def0u32.to_le_bytes());
+
+        let caps = parse_capabilities(&payload).expect("capabilities should parse");
+        assert_eq!(caps, vec![0x1234_5678, 0x9abc_def0]);
+    }
+
+    #[test]
+    fn clipboard_grab_parses_selection_and_serial() {
+        let state = state_with(true, true, 4);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&selection_prefix());
+        payload.extend_from_slice(&9u32.to_le_bytes());
+        payload.extend_from_slice(&VD_AGENT_CLIPBOARD_UTF8_TEXT.to_le_bytes());
+
+        let (selection, serial, types) =
+            parse_clipboard_grab(&state, &payload).expect("clipboard grab should parse");
+
+        assert_eq!(selection, VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD);
+        assert_eq!(serial, Some(9));
+        assert_eq!(types, vec![VD_AGENT_CLIPBOARD_UTF8_TEXT]);
+        assert_eq!(state.lock().unwrap().serial_counter, 9);
+    }
+
+    #[test]
+    fn stale_clipboard_grab_serial_is_discarded() {
+        let state = state_with(true, true, 10);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&selection_prefix());
+        payload.extend_from_slice(&3u32.to_le_bytes());
+        payload.extend_from_slice(&VD_AGENT_CLIPBOARD_UTF8_TEXT.to_le_bytes());
+
+        let (selection, serial, types) =
+            parse_clipboard_grab(&state, &payload).expect("clipboard grab should parse");
+
+        assert_eq!(selection, VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD);
+        assert_eq!(serial, Some(3));
+        assert!(types.is_empty());
+        assert_eq!(state.lock().unwrap().serial_counter, 10);
+    }
 }

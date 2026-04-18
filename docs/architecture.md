@@ -43,7 +43,7 @@ Technically, a custom Wayland agent could talk to `/run/spice-vdagentd/spice-vda
 
 ### Guest Wayland -> host
 
-1. The bridge watches the Wayland clipboard using `wlr-data-control` events on the first target, Hyprland/wlroots.
+1. The bridge watches the Wayland clipboard using `ext-data-control` or `wlr-data-control` selection events.
 2. When text changes, the bridge caches the UTF-8 text locally.
 3. It sends `VD_AGENT_CLIPBOARD_GRAB` for `VD_AGENT_CLIPBOARD_UTF8_TEXT`.
 4. When the host later sends `VD_AGENT_CLIPBOARD_REQUEST`, the bridge replies with `VD_AGENT_CLIPBOARD`.
@@ -68,7 +68,7 @@ That crate uses:
 
 For the first target, Hyprland/wlroots, `wlr-data-control` compatibility is the important path.
 
-Clipboard read/write still uses `wl-clipboard-rs`, but guest clipboard change detection now prefers a direct `wlr-data-control` watcher thread for better responsiveness and fewer races on wlroots compositors. If that watcher cannot be started, the bridge falls back to polling.
+Clipboard read/write still uses `wl-clipboard-rs`, but guest clipboard change detection now prefers a direct watcher thread using `ext-data-control` when available and `wlr-data-control` otherwise. If that watcher cannot be started, the bridge falls back to polling.
 
 ## SPICE protocol subset implemented in v1
 
@@ -93,8 +93,8 @@ Only the regular clipboard selection is implemented in v1.
 - Clipboard only
 - Regular clipboard only
 - Text only
-- Event-driven watch support currently targets `wlr-data-control` compositors first
-- Non-`wlr-data-control` environments currently fall back to polling
+- Event-driven watch support currently depends on `ext-data-control` or `wlr-data-control`
+- Environments without both `ext-data-control` and `wlr-data-control` fall back to polling
 - No image, HTML, URI-list, or file-transfer support yet
 
 ## References
