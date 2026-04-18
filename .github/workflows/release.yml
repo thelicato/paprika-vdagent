@@ -109,3 +109,53 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+
+  build-pacman-package:
+    needs: prepare-release
+    runs-on: ubuntu-24.04
+    container:
+      image: archlinux:base-devel
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install pacman build dependencies
+        run: |
+          pacman -Syu --noconfirm cargo pkgconf wayland
+
+      - name: Build pacman package
+        run: |
+          useradd --create-home builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+          su builder -c "cd '$GITHUB_WORKSPACE/packaging/pacman' && makepkg -sf --noconfirm --nodeps --cleanbuild"
+
+      - name: Stage pacman package artifact
+        run: |
+          mkdir -p dist
+          cp packaging/pacman/*.pkg.tar.* dist/
+
+      - name: Upload pacman package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pacman-package
+          path: dist/*.pkg.tar.*
+          if-no-files-found: error
+
+  upload-pacman-package:
+    needs:
+      - prepare-release
+      - build-pacman-package
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Download pacman package artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: pacman-package
+          path: dist
+
+      - name: Upload pacman package to release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "$GITHUB_REF_NAME" dist/* --clobber

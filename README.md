@@ -39,6 +39,7 @@ pkill -x spice-vdagent || true
 Use the release artifact that matches your architecture:
 
 - `x86_64` or `arm64` tarball
+- `x86_64` pacman package
 - `.deb`
 - `.rpm`
 
