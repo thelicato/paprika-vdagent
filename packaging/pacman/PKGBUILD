@@ -18,34 +18,45 @@ install='paprika-vdagent.install'
 source=()
 sha256sums=()
 
-_source_root="$startdir/../.."
-_build_root="$srcdir/$pkgname-$pkgver"
+source_root() {
+  printf '%s\n' "$startdir/../.."
+}
+
+build_root() {
+  printf '%s\n' "$srcdir/$pkgname-$pkgver"
+}
 
 prepare() {
-  rm -rf "$_build_root"
-  mkdir -p "$_build_root"
+  local source_root_path
+  local build_root_path
+
+  source_root_path="$(source_root)"
+  build_root_path="$(build_root)"
+
+  rm -rf "$build_root_path"
+  mkdir -p "$build_root_path"
 
   bsdtar \
     --exclude .git \
     --exclude target \
     --exclude dist \
     -cf - \
-    -C "$_source_root" \
-    . | bsdtar -xf - -C "$_build_root"
+    -C "$source_root_path" \
+    . | bsdtar -xf - -C "$build_root_path"
 }
 
 build() {
-  cd "$_build_root"
+  cd "$(build_root)"
   cargo build --locked --release
 }
 
 check() {
-  cd "$_build_root"
+  cd "$(build_root)"
   cargo test --locked
 }
 
 package() {
-  cd "$_build_root"
+  cd "$(build_root)"
 
   install -Dm755 target/release/paprika-vdagent \
     "$pkgdir/usr/bin/paprika-vdagent"
