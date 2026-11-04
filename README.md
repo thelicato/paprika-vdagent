@@ -77,24 +77,24 @@ Install the package with your distro tools, or unpack the tarball and run `papri
 
 The packaged installs include a systemd user service at `/usr/lib/systemd/user/paprika-vdagent.service`. It is not enabled automatically.
 
-After installing a package, enable and start it with:
+For persistent setup, follow **[Installation and session startup](docs/setup.md)**.
+The guide covers package installation on common distributions, disabling competing
+stock agents, persistent port permissions, Hyprland Lua and legacy configuration,
+Sway, other session managers, and troubleshooting.
 
-```bash
-systemctl --user import-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR HYPRLAND_INSTANCE_SIGNATURE
-systemctl --user daemon-reload
-systemctl --user enable --now paprika-vdagent.service
-```
+Start Paprika from your Wayland session after login so it receives the current
+compositor environment. Enabling the user service alone does not configure port
+permissions or guarantee that environment is available.
 
-For tarball installs, run the binary manually or install the service file yourself from `packaging/systemd/user/paprika-vdagent.service`.
-
-For pacman-based systems, the repo also includes a local package recipe in `packaging/pacman/`.
+For pacman-based systems, the repo also includes a local package recipe in
+`packaging/pacman/`.
 
 ## 🛠️ Build
 
 Install the Rust toolchain and the Wayland development packages for your distro, then build:
 
 ```bash
-cargo build --release
+cargo build --locked --release
 ```
 
 The binary will be at:
