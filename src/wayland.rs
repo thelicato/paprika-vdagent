@@ -1,5 +1,6 @@
 use std::fmt;
-use std::io::Read;
+use std::io;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use tracing::warn;
@@ -9,10 +10,11 @@ use wl_clipboard_rs::copy::{
 };
 use wl_clipboard_rs::paste::{
     ClipboardType as PasteClipboardType, Error as PasteError, MimeType as PasteMimeType,
-    Seat as PasteSeat, get_contents,
+    Seat as PasteSeat, get_contents, get_mime_types,
 };
 use wl_clipboard_rs::utils::{PrimarySelectionCheckError, is_primary_selection_supported};
 
+use crate::clipboard_io::read_clipboard_bytes;
 use crate::selection::ClipboardSelection;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,15 +48,23 @@ impl fmt::Display for SeatSelector {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum ClipboardRead {
+    Ready(Option<String>),
+    Retry,
+}
+
 pub struct WaylandClipboard {
+    read_timeout: Duration,
     max_text_bytes: usize,
     seat: SeatSelector,
     primary_supported: bool,
 }
 
 impl WaylandClipboard {
-    pub fn new(max_text_bytes: usize, seat: SeatSelector) -> Result<Self> {
+    pub fn new(max_text_bytes: usize, seat: SeatSelector, read_timeout: Duration) -> Result<Self> {
         let clipboard = Self {
+            read_timeout,
             max_text_bytes,
             seat,
             primary_supported: detect_primary_selection_support()?,
@@ -63,9 +73,9 @@ impl WaylandClipboard {
         Ok(clipboard)
     }
 
-    pub fn read_text(&self, selection: ClipboardSelection) -> Result<Option<String>> {
+    pub fn read_text(&self, selection: ClipboardSelection) -> Result<ClipboardRead> {
         if !self.selection_supported(selection) {
-            return Ok(None);
+            return Ok(ClipboardRead::Ready(None));
         }
 
         match get_contents(
@@ -74,10 +84,20 @@ impl WaylandClipboard {
             PasteMimeType::Text,
         ) {
             Ok((pipe, _mime)) => {
-                let mut bytes = Vec::new();
-                pipe.take((self.max_text_bytes + 1) as u64)
-                    .read_to_end(&mut bytes)
-                    .context("failed to read Wayland clipboard contents")?;
+                let bytes = match read_clipboard_bytes(pipe, self.max_text_bytes, self.read_timeout)
+                {
+                    Ok(bytes) => bytes,
+                    Err(err) if err.kind() == io::ErrorKind::TimedOut => {
+                        warn!(
+                            "Wayland {selection} read timed out after {} ms; keeping the cached selection and retrying",
+                            self.read_timeout.as_millis()
+                        );
+                        return Ok(ClipboardRead::Retry);
+                    }
+                    Err(err) => {
+                        return Err(err).context("failed to read Wayland clipboard contents");
+                    }
+                };
 
                 if bytes.len() > self.max_text_bytes {
                     warn!(
@@ -86,19 +106,19 @@ impl WaylandClipboard {
                         bytes.len(),
                         self.max_text_bytes
                     );
-                    return Ok(None);
+                    return Ok(ClipboardRead::Ready(None));
                 }
 
                 let text = String::from_utf8(bytes)
                     .context("Wayland clipboard did not contain valid UTF-8 text")?;
-                Ok(Some(text))
+                Ok(ClipboardRead::Ready(Some(text)))
             }
             Err(
                 PasteError::NoSeats
                 | PasteError::ClipboardEmpty
                 | PasteError::NoMimeType
                 | PasteError::PrimarySelectionUnsupported,
-            ) => Ok(None),
+            ) => Ok(ClipboardRead::Ready(None)),
             Err(PasteError::MissingProtocol { name, version }) => {
                 bail!("required Wayland clipboard protocol {name} v{version} is not available")
             }
@@ -156,9 +176,10 @@ impl WaylandClipboard {
     }
 
     fn probe(&self) -> Result<()> {
-        match self.read_text(ClipboardSelection::Clipboard) {
-            Ok(_) => Ok(()),
-            Err(err) => Err(err),
+        // Probe the protocol and seat without asking a clipboard owner for data.
+        match get_mime_types(PasteClipboardType::Regular, self.seat.paste_seat()) {
+            Ok(_) | Err(PasteError::ClipboardEmpty | PasteError::NoMimeType) => Ok(()),
+            Err(err) => Err(err).context("failed to probe Wayland clipboard"),
         }
     }
 

@@ -135,16 +135,6 @@ impl FileTransferManager {
             return Ok(());
         }
 
-        if transfer.written_size > transfer.metadata.size {
-            warn!(
-                "file transfer id={} exceeded declared size: {} > {}",
-                id, transfer.written_size, transfer.metadata.size
-            );
-            transfer.cleanup();
-            transport.send_file_xfer_status(id, VD_AGENT_FILE_XFER_STATUS_ERROR)?;
-            return Ok(());
-        }
-
         if transfer.written_size == transfer.metadata.size {
             match transfer.finish() {
                 Ok(path) => {
@@ -152,7 +142,7 @@ impl FileTransferManager {
                     transport.send_file_xfer_status(id, VD_AGENT_FILE_XFER_STATUS_SUCCESS)?;
                 }
                 Err(err) => {
-                    warn!("failed to finalize file transfer id={id}: {err:#}");
+                    warn!("failed to finalise file transfer id={id}: {err:#}");
                     transport.send_file_xfer_status(id, VD_AGENT_FILE_XFER_STATUS_ERROR)?;
                 }
             }
@@ -222,13 +212,23 @@ impl IncomingTransfer {
     }
 
     fn write_chunk(&mut self, payload: &[u8]) -> Result<()> {
+        let written_size = self
+            .written_size
+            .checked_add(payload.len() as u64)
+            .context("file transfer size overflow")?;
+        if written_size > self.metadata.size {
+            bail!(
+                "file transfer exceeded declared size: {written_size} > {}",
+                self.metadata.size
+            );
+        }
         self.file.write_all(payload).with_context(|| {
             format!(
                 "failed to write temporary file {}",
                 self.temp_path.display()
             )
         })?;
-        self.written_size += payload.len() as u64;
+        self.written_size = written_size;
         Ok(())
     }
 
@@ -239,7 +239,6 @@ impl IncomingTransfer {
                 self.temp_path.display()
             )
         })?;
-        drop(self.file);
 
         let parent = self
             .final_path
@@ -263,8 +262,21 @@ impl IncomingTransfer {
     }
 
     fn cleanup(self) {
-        drop(self.file);
+        drop(self);
+    }
+}
+
+impl Drop for IncomingTransfer {
+    fn drop(&mut self) {
+        // On success the temporary path has already been renamed. On every
+        // other exit path, including errors while finishing, remove the part.
         let _ = fs::remove_file(&self.temp_path);
+    }
+}
+
+impl Drop for FileTransferManager {
+    fn drop(&mut self) {
+        self.cancel_all("bridge stopped");
     }
 }
 
@@ -465,6 +477,119 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    fn manager_and_transport(dir: &TestDir) -> (FileTransferManager, SpiceTransport) {
+        let manager = FileTransferManager::new(Some(dir.path.clone()), Some(8)).unwrap();
+        let transport =
+            SpiceTransport::test_writer(File::create(dir.path.join("status.bin")).unwrap());
+        (manager, transport)
+    }
+
+    fn assert_no_parts(dir: &TestDir) {
+        for entry in fs::read_dir(&dir.path).unwrap() {
+            assert_ne!(
+                entry
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .and_then(|ext| ext.to_str()),
+                Some("part")
+            );
+        }
+    }
+
+    #[test]
+    fn cancellation_removes_partial_files_and_allows_transfer_id_reuse() {
+        let dir = TestDir::new();
+        let (mut manager, transport) = manager_and_transport(&dir);
+        let metadata = b"[vdagent-file-xfer]\nname=hello.txt\nsize=5\n";
+        manager.handle_start(&transport, 1, metadata).unwrap();
+        manager.handle_data(&transport, 1, b"he").unwrap();
+        manager.cancel_all("client disconnected");
+        assert_no_parts(&dir);
+        assert!(!dir.path.join("hello.txt").exists());
+        manager.handle_start(&transport, 1, metadata).unwrap();
+        manager.handle_data(&transport, 1, b"hello").unwrap();
+        assert_eq!(fs::read(dir.path.join("hello.txt")).unwrap(), b"hello");
+        assert_no_parts(&dir);
+    }
+
+    #[test]
+    fn dropping_the_bridge_cleans_up_interrupted_transfers() {
+        let dir = TestDir::new();
+        let (mut manager, transport) = manager_and_transport(&dir);
+        manager
+            .handle_start(
+                &transport,
+                1,
+                b"[vdagent-file-xfer]\nname=hello.txt\nsize=5\n",
+            )
+            .unwrap();
+        manager.handle_data(&transport, 1, b"he").unwrap();
+        drop(manager);
+        assert_no_parts(&dir);
+        assert!(!dir.path.join("hello.txt").exists());
+    }
+
+    #[test]
+    fn failed_finalisation_removes_the_temporary_file() {
+        let dir = TestDir::new();
+        let (mut manager, transport) = manager_and_transport(&dir);
+        manager
+            .handle_start(
+                &transport,
+                1,
+                b"[vdagent-file-xfer]\nname=hello.txt\nsize=5\n",
+            )
+            .unwrap();
+        // Force rename failure without relying on root-sensitive permissions.
+        manager.active.get_mut(&1).unwrap().final_path = dir.path.join("missing-parent/hello.txt");
+        manager.handle_data(&transport, 1, b"hello").unwrap();
+        assert_no_parts(&dir);
+        assert!(manager.active.is_empty());
+    }
+
+    #[test]
+    fn early_end_and_host_cancellation_remove_partial_files() {
+        for cancelled in [false, true] {
+            let dir = TestDir::new();
+            let (mut manager, transport) = manager_and_transport(&dir);
+            manager
+                .handle_start(
+                    &transport,
+                    1,
+                    b"[vdagent-file-xfer]\nname=hello.txt\nsize=5\n",
+                )
+                .unwrap();
+            manager.handle_data(&transport, 1, b"he").unwrap();
+            if cancelled {
+                manager.handle_host_status(1, VD_AGENT_FILE_XFER_STATUS_CANCELLED);
+            } else {
+                manager.handle_data(&transport, 1, b"").unwrap();
+            }
+            assert_no_parts(&dir);
+            assert!(manager.active.is_empty());
+            assert!(!dir.path.join("hello.txt").exists());
+        }
+    }
+
+    #[test]
+    fn oversized_chunks_are_rejected_before_writing() {
+        let dir = TestDir::new();
+        let mut transfer = IncomingTransfer::create(
+            &dir.path,
+            1,
+            FileTransferMetadata {
+                name: "hello.txt".into(),
+                size: 2,
+            },
+        )
+        .unwrap();
+        assert!(transfer.write_chunk(b"too large").is_err());
+        assert_eq!(fs::metadata(&transfer.temp_path).unwrap().len(), 0);
+        drop(transfer);
+        assert_no_parts(&dir);
     }
 
     #[test]

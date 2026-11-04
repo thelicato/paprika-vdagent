@@ -1,3 +1,4 @@
+mod clipboard_io;
 mod doctor;
 mod file_transfer;
 mod selection;
@@ -9,7 +10,7 @@ mod wayland_watch;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -18,7 +19,7 @@ use selection::ClipboardSelection;
 use spice::{PeerCapabilities, SpiceTransport, TransportEvent, VD_AGENT_CLIPBOARD_UTF8_TEXT};
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
-use wayland::{SeatSelector, WaylandClipboard};
+use wayland::{ClipboardRead, SeatSelector, WaylandClipboard};
 use wayland_watch::{WatchEvent, spawn_selection_watcher};
 
 #[derive(Parser, Debug)]
@@ -34,11 +35,15 @@ struct Cli {
     )]
     virtio_port: PathBuf,
 
-    #[arg(long, env = "PAPRIKA_VDAGENT_POLL_MS", default_value_t = 250)]
+    #[arg(long, env = "PAPRIKA_VDAGENT_POLL_MS", default_value_t = 250, value_parser = clap::value_parser!(u64).range(1..))]
     poll_ms: u64,
 
     #[arg(long, env = "PAPRIKA_VDAGENT_MAX_TEXT_BYTES", default_value_t = 1024 * 1024)]
     max_text_bytes: usize,
+
+    /// Maximum time to wait for a clipboard source to finish sending its payload
+    #[arg(long, env = "PAPRIKA_VDAGENT_CLIPBOARD_TIMEOUT_MS", default_value_t = 2000, value_parser = clap::value_parser!(u64).range(1..))]
+    clipboard_timeout_ms: u64,
 
     #[arg(long, env = "PAPRIKA_VDAGENT_SEAT")]
     seat: Option<String>,
@@ -78,6 +83,8 @@ struct SelectionState {
     last_wayland_text: Option<String>,
     suppress_text: Option<String>,
     suppress_empty: bool,
+    retry_since: Option<Instant>,
+    read_pending: bool,
 }
 
 #[derive(Debug, Default)]
@@ -100,6 +107,24 @@ impl Default for ClipboardOwner {
 }
 
 impl BridgeState {
+    fn client_disconnected(&mut self) {
+        self.peer_caps = None;
+        for selection in ClipboardSelection::ALL {
+            let state = self.selection_state_mut(selection);
+            // Keep the visible clipboard available to the guest and announce it
+            // as local data when a new client negotiates its capabilities.
+            state.guest_cache = state.last_wayland_text.clone();
+            state.owner = if state.guest_cache.is_some() {
+                ClipboardOwner::Guest
+            } else {
+                ClipboardOwner::Empty
+            };
+            state.host_cache = None;
+            state.suppress_text = None;
+            state.suppress_empty = false;
+        }
+    }
+
     fn selection_state(&self, selection: ClipboardSelection) -> &SelectionState {
         match selection {
             ClipboardSelection::Clipboard => &self.clipboard,
@@ -135,7 +160,11 @@ fn run(cli: Cli) -> Result<()> {
         .as_ref()
         .map(|seat| SeatSelector::Specific(seat.clone()))
         .unwrap_or(SeatSelector::Unspecified);
-    let clipboard = WaylandClipboard::new(cli.max_text_bytes, seat.clone())?;
+    let clipboard = WaylandClipboard::new(
+        cli.max_text_bytes,
+        seat.clone(),
+        Duration::from_millis(cli.clipboard_timeout_ms),
+    )?;
     let mut file_transfers =
         FileTransferManager::new(cli.file_dir.clone(), Some(cli.max_active_file_transfers))?;
 
@@ -171,16 +200,8 @@ fn run(cli: Cli) -> Result<()> {
     }
 
     for selection in ClipboardSelection::ALL {
-        if let Some(text) = clipboard.read_text(selection)? {
-            info!(
-                "detected existing guest {selection} text at startup ({} bytes)",
-                text.len()
-            );
-            let selection_state = state.selection_state_mut(selection);
-            selection_state.owner = ClipboardOwner::Guest;
-            selection_state.guest_cache = Some(text.clone());
-            selection_state.last_wayland_text = Some(text);
-        }
+        let snapshot = clipboard.read_text(selection)?;
+        handle_wayland_read(&transport, &mut state, selection, snapshot)?;
     }
 
     let poll_interval = Duration::from_millis(cli.poll_ms);
@@ -200,21 +221,10 @@ fn run(cli: Cli) -> Result<()> {
         cli.poll_ms
     );
 
+    let mut next_poll = Instant::now() + poll_interval;
     loop {
-        if watcher_active {
-            let event = bridge_rx
-                .recv()
-                .context("all bridge event senders disconnected unexpectedly")?;
-            handle_bridge_event(
-                &transport,
-                &clipboard,
-                &mut state,
-                &mut file_transfers,
-                event,
-                &mut watcher_active,
-            )?;
-
-            while let Ok(event) = bridge_rx.try_recv() {
+        match bridge_rx.recv_timeout(poll_interval) {
+            Ok(event) => {
                 handle_bridge_event(
                     &transport,
                     &clipboard,
@@ -223,10 +233,8 @@ fn run(cli: Cli) -> Result<()> {
                     event,
                     &mut watcher_active,
                 )?;
-            }
-        } else {
-            match bridge_rx.recv_timeout(poll_interval) {
-                Ok(event) => {
+                // Limit each batch so retry work cannot be starved by SPICE traffic.
+                for event in bridge_rx.try_iter().take(64) {
                     handle_bridge_event(
                         &transport,
                         &clipboard,
@@ -235,27 +243,28 @@ fn run(cli: Cli) -> Result<()> {
                         event,
                         &mut watcher_active,
                     )?;
-                    while let Ok(event) = bridge_rx.try_recv() {
-                        handle_bridge_event(
-                            &transport,
-                            &clipboard,
-                            &mut state,
-                            &mut file_transfers,
-                            event,
-                            &mut watcher_active,
-                        )?;
-                    }
-                }
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => {
-                    bail!("all bridge event senders disconnected unexpectedly")
                 }
             }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                bail!("all bridge event senders disconnected unexpectedly")
+            }
+        }
 
-            for selection in ClipboardSelection::ALL {
+        let poll_due = Instant::now() >= next_poll;
+        for selection in ClipboardSelection::ALL {
+            let selection_state = state.selection_state(selection);
+            let read_due = selection_state.read_pending
+                && selection_state
+                    .retry_since
+                    .is_none_or(|since| since.elapsed() >= poll_interval);
+            if (!watcher_active && poll_due) || read_due {
                 let snapshot = clipboard.read_text(selection)?;
-                handle_wayland_snapshot(&transport, &mut state, selection, snapshot)?;
+                handle_wayland_read(&transport, &mut state, selection, snapshot)?;
             }
+        }
+        if poll_due {
+            next_poll = Instant::now() + poll_interval;
         }
     }
 }
@@ -473,6 +482,7 @@ fn handle_bridge_event(
             TransportEvent::HostClientDisconnected => {
                 info!("SPICE client disconnected, cancelling in-flight file transfers");
                 file_transfers.cancel_all("SPICE client disconnected");
+                state.client_disconnected();
             }
             TransportEvent::Disconnected(message) => {
                 file_transfers.cancel_all("SPICE transport disconnected");
@@ -480,8 +490,11 @@ fn handle_bridge_event(
             }
         },
         BridgeEvent::WaylandSelectionChanged(selection) => {
-            let snapshot = clipboard.read_text(selection)?;
-            handle_wayland_snapshot(transport, state, selection, snapshot)?;
+            // Coalesce selection events before reading. A new owner also
+            // supersedes a stalled source's retry delay.
+            let selection_state = state.selection_state_mut(selection);
+            selection_state.read_pending = true;
+            selection_state.retry_since = None;
         }
         BridgeEvent::WaylandWatcherDisconnected(message) => {
             warn!("{message}; switching back to polling mode");
@@ -490,6 +503,28 @@ fn handle_bridge_event(
     }
 
     Ok(())
+}
+
+fn handle_wayland_read(
+    transport: &SpiceTransport,
+    state: &mut BridgeState,
+    selection: ClipboardSelection,
+    snapshot: ClipboardRead,
+) -> Result<()> {
+    match snapshot {
+        ClipboardRead::Ready(contents) => {
+            let selection_state = state.selection_state_mut(selection);
+            selection_state.read_pending = false;
+            selection_state.retry_since = None;
+            handle_wayland_snapshot(transport, state, selection, contents)
+        }
+        ClipboardRead::Retry => {
+            let selection_state = state.selection_state_mut(selection);
+            selection_state.read_pending = true;
+            selection_state.retry_since = Some(Instant::now());
+            Ok(())
+        }
+    }
 }
 
 fn handle_wayland_snapshot(
@@ -554,4 +589,101 @@ fn init_logging() {
         .with_thread_names(true)
         .compact()
         .init();
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use std::fs::File;
+
+    fn transport() -> SpiceTransport {
+        SpiceTransport::test_writer(File::options().write(true).open("/dev/null").unwrap())
+    }
+
+    #[test]
+    fn a_timed_out_read_keeps_cached_data_and_a_successful_retry_updates_it() {
+        let transport = transport();
+        let mut state = BridgeState::default();
+        state.clipboard.owner = ClipboardOwner::Guest;
+        state.clipboard.guest_cache = Some("cached".into());
+        state.clipboard.last_wayland_text = Some("cached".into());
+        handle_wayland_read(
+            &transport,
+            &mut state,
+            ClipboardSelection::Clipboard,
+            ClipboardRead::Retry,
+        )
+        .unwrap();
+        assert_eq!(state.clipboard.owner, ClipboardOwner::Guest);
+        assert_eq!(state.clipboard.guest_cache.as_deref(), Some("cached"));
+        assert_eq!(state.clipboard.last_wayland_text.as_deref(), Some("cached"));
+        assert!(state.clipboard.read_pending);
+        assert!(state.clipboard.retry_since.is_some());
+        handle_wayland_read(
+            &transport,
+            &mut state,
+            ClipboardSelection::Clipboard,
+            ClipboardRead::Ready(Some("recovered".into())),
+        )
+        .unwrap();
+        assert_eq!(state.clipboard.guest_cache.as_deref(), Some("recovered"));
+        assert!(!state.clipboard.read_pending);
+        assert!(state.clipboard.retry_since.is_none());
+    }
+
+    #[test]
+    fn a_timed_out_read_does_not_release_host_ownership() {
+        let transport = transport();
+        let mut state = BridgeState::default();
+        state.primary.owner = ClipboardOwner::Host;
+        state.primary.host_cache = Some("host text".into());
+        state.primary.last_wayland_text = Some("host text".into());
+        state.primary.suppress_text = Some("host text".into());
+        handle_wayland_read(
+            &transport,
+            &mut state,
+            ClipboardSelection::Primary,
+            ClipboardRead::Retry,
+        )
+        .unwrap();
+        assert_eq!(state.primary.owner, ClipboardOwner::Host);
+        assert_eq!(state.primary.host_cache.as_deref(), Some("host text"));
+        assert_eq!(state.primary.suppress_text.as_deref(), Some("host text"));
+    }
+
+    #[test]
+    fn disconnected_client_leaves_visible_text_ready_for_the_next_client() {
+        let mut state = BridgeState {
+            peer_caps: Some(PeerCapabilities {
+                clipboard_by_demand: true,
+                clipboard_selection: true,
+                clipboard_grab_serial: true,
+            }),
+            ..BridgeState::default()
+        };
+        state.clipboard.owner = ClipboardOwner::Host;
+        state.clipboard.host_cache = Some("visible text".into());
+        state.clipboard.last_wayland_text = Some("visible text".into());
+        state.clipboard.suppress_text = Some("visible text".into());
+        state.primary.suppress_empty = true;
+        state.client_disconnected();
+        assert!(state.peer_caps.is_none());
+        assert_eq!(state.clipboard.owner, ClipboardOwner::Guest);
+        assert_eq!(state.clipboard.guest_cache.as_deref(), Some("visible text"));
+        assert_eq!(
+            state.clipboard.last_wayland_text.as_deref(),
+            Some("visible text")
+        );
+        assert!(state.clipboard.host_cache.is_none());
+        assert!(state.clipboard.suppress_text.is_none());
+        assert!(!state.primary.suppress_empty);
+        assert_eq!(state.primary.owner, ClipboardOwner::Empty);
+    }
+
+    #[test]
+    fn zero_poll_interval_and_zero_clipboard_timeout_are_rejected() {
+        for flag in ["--poll-ms", "--clipboard-timeout-ms"] {
+            assert!(Cli::try_parse_from(["paprika-vdagent", flag, "0"]).is_err());
+        }
+    }
 }

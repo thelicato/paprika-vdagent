@@ -82,6 +82,10 @@ For the first target, Hyprland/wlroots, `wlr-data-control` compatibility is the 
 
 Clipboard read/write still uses `wl-clipboard-rs`, but guest clipboard change detection now prefers a direct watcher thread using `ext-data-control` when available and `wlr-data-control` otherwise. If that watcher cannot be started, the bridge falls back to polling.
 
+Payload reads use a non-blocking pipe and a total deadline, configured by `--clipboard-timeout-ms` (default 2000 ms). Timeouts preserve the cached clipboard and schedule a retry. Clipboard change events are coalesced before reading each selection. A finished data-control device or watcher disconnect switches change detection to polling; a lost compositor or SPICE transport causes an error exit so the service can restart the bridge. Wayland protocol roundtrips are not covered by the payload deadline.
+
+On SPICE client disconnect, transport capabilities and serial state are reset, in-progress file transfers are cancelled, and the visible clipboard is retained as guest-owned data for the next client's capability negotiation. Temporary downloads are removed on cancellation, transfer errors, and normal Rust resource cleanup, including an error exit. Termination by a signal and power loss can leave temporary files.
+
 Regular clipboard and primary selection are both supported in the current implementation. Secondary selection is still intentionally unsupported.
 
 ## SPICE protocol subset implemented in v1
@@ -116,7 +120,7 @@ Currently implemented selections:
 - File transfer currently covers the standard client-to-guest path only
 - Detailed SPICE file-transfer error payloads are not implemented
 - Event-driven watch support currently depends on `ext-data-control` or `wlr-data-control`
-- Environments without both `ext-data-control` and `wlr-data-control` fall back to polling
+- Polling fallback still requires `ext-data-control` or `wlr-data-control` for clipboard access
 
 ## References
 

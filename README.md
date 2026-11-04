@@ -55,6 +55,8 @@ Options:
           [env: PAPRIKA_VDAGENT_PORT=] [default: /dev/virtio-ports/com.redhat.spice.0]
       --poll-ms <POLL_MS>
           [env: PAPRIKA_VDAGENT_POLL_MS=] [default: 250]
+      --clipboard-timeout-ms <CLIPBOARD_TIMEOUT_MS>
+          [env: PAPRIKA_VDAGENT_CLIPBOARD_TIMEOUT_MS=] [default: 2000]
       --max-text-bytes <MAX_TEXT_BYTES>
           [env: PAPRIKA_VDAGENT_MAX_TEXT_BYTES=] [default: 1048576]
       --seat <SEAT>

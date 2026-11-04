@@ -155,6 +155,7 @@ fn initialize_watcher(
         sender,
         seats,
         armed: false,
+        finished: false,
     };
 
     queue
@@ -171,6 +172,9 @@ fn initialize_watcher(
         }
     }
 
+    if state.finished {
+        bail!("Wayland data-control device finished during watcher startup");
+    }
     state.armed = true;
     info!("started event-driven Wayland clipboard watcher");
 
@@ -179,6 +183,9 @@ fn initialize_watcher(
 
 fn watch_loop(queue: &mut EventQueue<WatchState>, state: &mut WatchState) -> Result<()> {
     loop {
+        if state.finished {
+            bail!("Wayland data-control device finished; clipboard watching stopped");
+        }
         queue
             .blocking_dispatch(state)
             .context("Wayland watcher disconnected unexpectedly")?;
@@ -210,6 +217,7 @@ struct WatchState {
     sender: Sender<WatchEvent>,
     seats: HashMap<WlSeat, SeatState>,
     armed: bool,
+    finished: bool,
 }
 
 impl WatchState {
@@ -290,18 +298,22 @@ impl Dispatch<ZwlrDataControlDeviceV1, WlSeat> for WatchState {
     ) {
         match event {
             zwlr_data_control_device_v1::Event::Selection { id } => {
+                if let Some(offer) = id {
+                    offer.destroy();
+                }
                 if state.armed && state.should_notify(seat) {
                     debug!("Wayland clipboard selection changed");
-                    let _ = id;
                     let _ = state
                         .sender
                         .send(WatchEvent::SelectionChanged(ClipboardSelection::Clipboard));
                 }
             }
             zwlr_data_control_device_v1::Event::PrimarySelection { id } => {
+                if let Some(offer) = id {
+                    offer.destroy();
+                }
                 if state.armed && state.should_notify(seat) {
                     debug!("Wayland primary selection changed");
-                    let _ = id;
                     let _ = state
                         .sender
                         .send(WatchEvent::SelectionChanged(ClipboardSelection::Primary));
@@ -309,6 +321,9 @@ impl Dispatch<ZwlrDataControlDeviceV1, WlSeat> for WatchState {
             }
             zwlr_data_control_device_v1::Event::Finished => {
                 warn!("Wayland data-control device was finished by the compositor");
+                if state.should_notify(seat) {
+                    state.finished = true;
+                }
                 if let Some(seat_state) = state.seats.get_mut(seat) {
                     seat_state.set_device(None);
                 }
@@ -333,18 +348,22 @@ impl Dispatch<ExtDataControlDeviceV1, WlSeat> for WatchState {
     ) {
         match event {
             ext_data_control_device_v1::Event::Selection { id } => {
+                if let Some(offer) = id {
+                    offer.destroy();
+                }
                 if state.armed && state.should_notify(seat) {
                     debug!("Wayland clipboard selection changed");
-                    let _ = id;
                     let _ = state
                         .sender
                         .send(WatchEvent::SelectionChanged(ClipboardSelection::Clipboard));
                 }
             }
             ext_data_control_device_v1::Event::PrimarySelection { id } => {
+                if let Some(offer) = id {
+                    offer.destroy();
+                }
                 if state.armed && state.should_notify(seat) {
                     debug!("Wayland primary selection changed");
-                    let _ = id;
                     let _ = state
                         .sender
                         .send(WatchEvent::SelectionChanged(ClipboardSelection::Primary));
@@ -352,6 +371,9 @@ impl Dispatch<ExtDataControlDeviceV1, WlSeat> for WatchState {
             }
             ext_data_control_device_v1::Event::Finished => {
                 warn!("Wayland data-control device was finished by the compositor");
+                if state.should_notify(seat) {
+                    state.finished = true;
+                }
                 if let Some(seat_state) = state.seats.get_mut(seat) {
                     seat_state.set_device(None);
                 }
@@ -386,5 +408,46 @@ impl Dispatch<ExtDataControlOfferV1, ()> for WatchState {
         _conn: &Connection,
         _qhandle: &QueueHandle<Self>,
     ) {
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    fn run_watch_loop(finished: bool, disconnect: bool) -> String {
+        let (client, server) = UnixStream::pair().unwrap();
+        let connection = Connection::from_socket(client).unwrap();
+        let mut queue = connection.new_event_queue::<WatchState>();
+        let (sender, _) = mpsc::channel();
+        let mut state = WatchState {
+            seat: SeatSelector::Unspecified,
+            sender,
+            seats: HashMap::new(),
+            armed: true,
+            finished,
+        };
+        if disconnect {
+            drop(server);
+        }
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let error = watch_loop(&mut queue, &mut state).unwrap_err();
+            tx.send(format!("{error:#}")).unwrap();
+        });
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("watcher must report failure promptly")
+    }
+
+    #[test]
+    fn compositor_disconnect_is_reported_to_the_watcher() {
+        assert!(run_watch_loop(false, true).contains("Wayland watcher disconnected unexpectedly"));
+    }
+
+    #[test]
+    fn finished_device_stops_watching_without_waiting_for_more_events() {
+        assert!(run_watch_loop(true, false).contains("data-control device finished"));
     }
 }

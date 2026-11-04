@@ -42,6 +42,15 @@ impl SpiceTransport {
             .open(path)
             .with_context(|| format!("failed to open virtio port {}", path.display()))?;
 
+        Self::from_file(path, file, sender, max_text_bytes)
+    }
+
+    fn from_file(
+        path: &Path,
+        file: File,
+        sender: Sender<TransportEvent>,
+        max_text_bytes: usize,
+    ) -> Result<Self> {
         let reader = file
             .try_clone()
             .context("failed to clone virtio port file descriptor")?;
@@ -73,6 +82,16 @@ impl SpiceTransport {
             .context("failed to spawn SPICE reader thread")?;
 
         Ok(transport)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_writer(file: File) -> Self {
+        Self {
+            path: PathBuf::from("test"),
+            writer: Arc::new(Mutex::new(file)),
+            state: Arc::new(Mutex::new(TransportState::default())),
+            max_text_bytes: 1024 * 1024,
+        }
     }
 
     pub fn peer_ready_for_clipboard(&self) -> bool {
@@ -399,6 +418,8 @@ fn reader_loop(
                     .context("failed to send HostFileXferStatus event")?;
             }
             VD_AGENT_CLIENT_DISCONNECTED => {
+                *state.lock().map_err(|_| anyhow!("state mutex poisoned"))? =
+                    TransportState::default();
                 sender
                     .send(TransportEvent::HostClientDisconnected)
                     .context("failed to send HostClientDisconnected event")?;
@@ -407,5 +428,124 @@ fn reader_loop(
                 trace!("ignoring unsupported SPICE message type {other}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Shutdown;
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    fn read_message(host: &mut UnixStream) -> (u32, Vec<u8>) {
+        let mut assembler = MessageAssembler::default();
+        loop {
+            let (port, bytes) = read_one_chunk(host).unwrap();
+            if let Some((_, kind, payload)) = assembler.push_chunk(port, &bytes).unwrap() {
+                return (kind, payload);
+            }
+        }
+    }
+
+    fn connect() -> (SpiceTransport, UnixStream, mpsc::Receiver<TransportEvent>) {
+        let (guest, mut host) = UnixStream::pair().unwrap();
+        host.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        host.set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (sender, events) = mpsc::channel();
+        let transport = SpiceTransport::from_file(
+            Path::new("test-socket"),
+            File::from(OwnedFd::from(guest)),
+            sender,
+            1024,
+        )
+        .unwrap();
+        assert_eq!(read_message(&mut host).0, VD_AGENT_ANNOUNCE_CAPABILITIES);
+        (transport, host, events)
+    }
+
+    fn announce(host: &mut UnixStream, events: &mpsc::Receiver<TransportEvent>, caps: u32) {
+        let mut payload = 0u32.to_le_bytes().to_vec();
+        payload.extend(caps.to_le_bytes());
+        host.write_all(&encode_message_frame(
+            VD_AGENT_ANNOUNCE_CAPABILITIES,
+            &payload,
+        ))
+        .unwrap();
+        assert!(matches!(
+            events.recv_timeout(Duration::from_secs(2)).unwrap(),
+            TransportEvent::PeerCapabilities(_)
+        ));
+    }
+
+    #[test]
+    fn client_reconnect_renegotiates_capabilities_and_resets_serials() {
+        let (transport, mut host, events) = connect();
+        let mut caps = 0;
+        set_capability(&mut caps, VD_AGENT_CAP_CLIPBOARD_BY_DEMAND);
+        set_capability(&mut caps, VD_AGENT_CAP_CLIPBOARD_SELECTION);
+        set_capability(&mut caps, VD_AGENT_CAP_CLIPBOARD_GRAB_SERIAL);
+        announce(&mut host, &events, caps);
+        assert!(
+            transport
+                .send_clipboard_grab_text(ClipboardSelection::Clipboard)
+                .unwrap()
+        );
+        assert_eq!(read_message(&mut host).1.len(), 12);
+        host.write_all(&encode_message_frame(VD_AGENT_CLIENT_DISCONNECTED, &[]))
+            .unwrap();
+        assert!(matches!(
+            events.recv_timeout(Duration::from_secs(2)).unwrap(),
+            TransportEvent::HostClientDisconnected
+        ));
+        assert!(!transport.peer_ready_for_clipboard());
+        assert!(
+            !transport
+                .send_clipboard_grab_text(ClipboardSelection::Clipboard)
+                .unwrap()
+        );
+
+        announce(&mut host, &events, caps);
+        assert!(
+            transport
+                .send_clipboard_grab_text(ClipboardSelection::Clipboard)
+                .unwrap()
+        );
+        let (_, payload) = read_message(&mut host);
+        assert_eq!(
+            le_u32(&payload[4..8]),
+            0,
+            "new client starts with serial zero"
+        );
+
+        host.write_all(&encode_message_frame(VD_AGENT_CLIENT_DISCONNECTED, &[]))
+            .unwrap();
+        assert!(matches!(
+            events.recv_timeout(Duration::from_secs(2)).unwrap(),
+            TransportEvent::HostClientDisconnected
+        ));
+        announce(&mut host, &events, 1 << VD_AGENT_CAP_CLIPBOARD_BY_DEMAND);
+        assert!(
+            transport
+                .send_clipboard_grab_text(ClipboardSelection::Clipboard)
+                .unwrap()
+        );
+        assert_eq!(
+            read_message(&mut host).1,
+            VD_AGENT_CLIPBOARD_UTF8_TEXT.to_le_bytes()
+        );
+    }
+
+    #[test]
+    fn broken_transport_reports_a_disconnect_instead_of_waiting_forever() {
+        let (_transport, host, events) = connect();
+        host.shutdown(Shutdown::Both).unwrap();
+        assert!(matches!(
+            events.recv_timeout(Duration::from_secs(2)).unwrap(),
+            TransportEvent::Disconnected(_)
+        ));
     }
 }

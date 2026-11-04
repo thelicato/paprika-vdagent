@@ -194,6 +194,23 @@ Environment=RUST_LOG=paprika_vdagent=debug
 
 Then restart the service. Other settings can be supplied in the same override, for example `Environment=PAPRIKA_VDAGENT_FILE_DIR=/home/your-user/Downloads`.
 
+### Clipboard timeouts and recovery
+
+Clipboard payload reads have a total deadline of 2000 ms, including sources that send partial data but never finish. A timed-out read leaves the cached clipboard intact and schedules another attempt after the polling interval (`--poll-ms`, default 250 ms). A fresh selection event supersedes a stalled source's retry delay. The deadline applies to receiving the payload from the clipboard owner; Wayland protocol roundtrips still depend on the compositor responding.
+
+To allow more time for a slow source, set `--clipboard-timeout-ms` when running manually, or add this to your service override:
+
+```ini
+[Service]
+Environment=PAPRIKA_VDAGENT_CLIPBOARD_TIMEOUT_MS=5000
+```
+
+Restart the service after editing its override. Both the clipboard timeout and polling interval must be greater than zero.
+
+If the event watcher disconnects or its data-control device finishes, the bridge falls back to polling. If the compositor itself is gone or the SPICE transport fails, the bridge exits with an error and the supplied systemd service restarts it. Without systemd, your session supervisor must restart it. A restarted compositor may have a different socket or session environment; run `paprika-vdagent session-start` from the new session to import it.
+
+A SPICE client disconnect cancels in-progress file transfers and resets capability negotiation. The visible clipboard stays available in the guest and is announced again after the next client negotiates its clipboard capabilities. Interrupted transfers are removed when cancelled or when the bridge exits normally, including error returns. Termination by a signal (including stopping the service), or a power failure, can leave `.paprika-vdagent-*.part` files; remove these only after stopping the bridge.
+
 ## Returning to the stock agent
 
 Remove the Paprika autostart entry, then:
