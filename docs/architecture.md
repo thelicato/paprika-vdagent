@@ -54,7 +54,7 @@ Technically, a custom Wayland agent could talk to `/run/spice-vdagentd/spice-vda
 1. The host side sends `VD_AGENT_CLIPBOARD_GRAB`.
 2. The bridge requests the text payload with `VD_AGENT_CLIPBOARD_REQUEST`.
 3. After `VD_AGENT_CLIPBOARD` arrives, the bridge writes that text into the matching Wayland selection using data-control.
-4. The bridge suppresses the immediate self-induced clipboard echo so the injected host clipboard is not reflected straight back to the host as a new guest grab.
+4. The bridge suppresses the immediate self-induced clipboard echo so the injected host clipboard is not reflected straight back to the host as a new guest grab. Suppression is consumed by the next successful snapshot, including an unchanged snapshot, so later guest edits and clears are announced normally.
 5. If the host sends `VD_AGENT_CLIPBOARD_RELEASE` and the bridge is still serving the host-owned text locally, the bridge clears the matching Wayland selection.
 
 ## File transfer flow

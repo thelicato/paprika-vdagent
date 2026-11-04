@@ -534,6 +534,10 @@ fn handle_wayland_snapshot(
     snapshot: Option<String>,
 ) -> Result<()> {
     let selection_state = state.selection_state_mut(selection);
+    // Suppression belongs to the next successful snapshot only. An unchanged
+    // snapshot still consumes it; retaining it would hide a later guest edit.
+    let suppress_text = selection_state.suppress_text.take();
+    let suppress_empty = std::mem::take(&mut selection_state.suppress_empty);
 
     match snapshot {
         Some(text) => {
@@ -541,9 +545,8 @@ fn handle_wayland_snapshot(
                 return Ok(());
             }
 
-            if selection_state.suppress_text.as_ref() == Some(&text) {
+            if suppress_text.as_ref() == Some(&text) {
                 debug!("suppressed host->guest {selection} echo for matching Wayland text");
-                selection_state.suppress_text = None;
                 selection_state.last_wayland_text = Some(text);
                 return Ok(());
             }
@@ -561,9 +564,8 @@ fn handle_wayland_snapshot(
                 return Ok(());
             }
 
-            if selection_state.suppress_empty {
+            if suppress_empty {
                 debug!("suppressed local empty {selection} event caused by host RELEASE");
-                selection_state.suppress_empty = false;
                 selection_state.last_wayland_text = None;
                 return Ok(());
             }

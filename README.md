@@ -124,6 +124,10 @@ If needed, you can pin a specific seat:
 RUST_LOG=paprika_vdagent=debug ./target/release/paprika-vdagent --seat seat0
 ```
 
+## Testing
+
+Run `cargo test --locked` for the standard suite. Full-bridge integration tests use private headless Sway instances and a simulated SPICE connection. See [Testing](docs/testing.md) for dependencies, commands, coverage, and limitations.
+
 ## 🪪 License
 
 `paprika-vdagent` is released under the [GPL-3.0 LICENSE](./LICENSE)
