@@ -3,7 +3,7 @@ name = "paprika-vdagent"
 version = "0.1.1"
 edition = "2024"
 license = "GPL-3.0-only"
-description = "Standalone Wayland SPICE clipboard and file-transfer bridge for Linux guests"
+description = "Standalone X11 and Wayland SPICE clipboard and file-transfer bridge for Linux guests"
 readme = "README.md"
 
 [package.metadata.deb]
@@ -13,7 +13,7 @@ priority = "optional"
 maintainer = "Angelo Delicato <thelicato@duck.com>"
 copyright = "thelicato"
 extended-description = """\
-paprika-vdagent is a standalone Wayland clipboard and file-transfer bridge for
+paprika-vdagent is a standalone X11 and Wayland clipboard and file-transfer bridge for
 SPICE/QEMU guests. It owns the SPICE virtio guest-agent channel directly and
 integrates with wlroots-style Wayland compositors without relying on X11
 clipboard mirroring.
@@ -42,13 +42,14 @@ assets = [
 [dependencies]
 anyhow = "1.0.100"
 clap = { version = "4.5.39", features = ["derive", "env"] }
-rustix = { version = "1.1.4", features = ["fs", "event"] }
+rustix = { version = "1.1.4", features = ["fs", "event", "pipe"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
 wayland-client = "0.31.14"
 wayland-protocols = { version = "0.32.12", features = ["client"] }
 wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
 wl-clipboard-rs = "0.9.3"
+x11rb = { version = "0.14.0", features = ["xfixes"] }
 
 [dev-dependencies]
-rustix = { version = "1.1.4", features = ["pipe", "pty", "termios"] }
+rustix = { version = "1.1.4", features = ["pipe", "pty", "termios", "process"] }

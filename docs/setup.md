@@ -1,6 +1,6 @@
 # Installation and session startup
 
-Paprika runs **inside the guest's Wayland session**, after login. It needs both access to the SPICE virtio port and a compositor exposing `ext-data-control` or `wlr-data-control`. A distro's package format does not determine compositor compatibility. The steps below assume one desktop user per guest.
+Paprika runs **inside the guest's graphical session**, after login. It needs access to the SPICE virtio port and either a Wayland compositor exposing `ext-data-control` or `wlr-data-control`, or an X11 server. Wayland is the default backend; native X11 sessions use `--backend x11`. A distro's package format does not determine display compatibility. The steps below assume one desktop user per guest.
 
 ## 1. Install
 
@@ -95,7 +95,7 @@ For temporary testing only, the following grants access until the device is recr
 sudo setfacl -m "u:$(id -un):rw" /dev/virtio-ports/com.redhat.spice.0
 ```
 
-## 4. Start with your Wayland session
+## 4. Start with your graphical session
 
 Run this once after installing or changing the service:
 
@@ -106,6 +106,32 @@ systemctl --user daemon-reload
 The installed binary provides `paprika-vdagent session-start`, which imports the current Wayland environment and restarts the systemd user service. It does not change permissions or stop competing agents.
 
 Choose **one** startup method below. Importing the Wayland environment must happen at each login; doing it once in a terminal does not configure future sessions. Start the agent after login, rather than as a root system service.
+
+### Native X11 sessions
+
+Run the installed binary from your X11 session:
+
+```sh
+paprika-vdagent --backend x11
+```
+
+The backend uses `DISPLAY` and the session's X authentication settings, including `XAUTHORITY` when set. It supports regular clipboard and primary selection, UTF-8 text, Latin-1 `STRING` conversion, and incremental transfers for large selections. XFixes supplies change notifications when available; otherwise the bridge polls using `--poll-ms`. Use `--poll-only` to force polling when troubleshooting unreliable notifications. `--seat` is specific to Wayland and must be omitted for X11.
+
+The Wayland `session-start` helper is not used for X11. Add `paprika-vdagent --backend x11` to your X11 desktop or window manager's autostart configuration. For desktops supporting XDG autostart, create `~/.config/autostart/paprika-vdagent.desktop` with:
+
+```ini
+[Desktop Entry]
+Type=Application
+Name=Paprika SPICE clipboard bridge
+Exec=/usr/bin/paprika-vdagent --backend x11
+Terminal=false
+```
+
+Use one Paprika launch method per session. Stop the Paprika user service before using direct X11 autostart, and disable its automatic startup if enabled. The stock SPICE agents must remain stopped and the port permissions from steps 2 and 3 still apply. This desktop entry is for X11 sessions; remove it before switching to a Wayland autostart method.
+
+### Wayland sessions
+
+The remaining startup examples use the default Wayland backend and its `session-start` helper.
 
 ### Hyprland: Lua configuration
 
@@ -151,13 +177,14 @@ GNOME and KDE Plasma installations must also expose one of the required data-con
 
 ## 5. Verify and troubleshoot
 
-Run diagnostics from your Wayland session without sudo:
+Run diagnostics from your session without sudo (choose the matching backend):
 
 ```sh
 paprika-vdagent doctor
+paprika-vdagent --backend x11 doctor
 ```
 
-The command checks the compositor connection, advertised data-control protocols, requested seat, SPICE port permissions, competing stock agents, download directory, and systemd user service. It does not open the SPICE port, read or replace clipboard contents, create directories, or start/stop services. `[FAIL]` indicates a blocking problem and produces a non-zero exit status. `[WARN]` indicates an optional, incomplete, or unverified check, such as a missing service when you launch the binary directly. Successful diagnostics establish local prerequisites; test actual host/guest clipboard and file transfers separately.
+The command checks the display connection, Wayland data-control protocols and requested seat or X11 selection capabilities and XFixes support, SPICE port permissions, competing stock agents, download directory, and systemd user service. It does not open the SPICE port, read or replace clipboard contents, create directories, or start/stop services. `[FAIL]` indicates a blocking problem and produces a non-zero exit status. `[WARN]` indicates an optional, incomplete, or unverified check, such as a missing service when you launch the binary directly. Successful diagnostics establish local prerequisites; test actual host/guest clipboard and file transfers separately.
 
 Place custom options before the subcommand, or use the same environment variables as the bridge:
 
@@ -180,6 +207,7 @@ After reboot and login, check the status and logs again and test clipboard sync 
 | `cargo: command not found` | Install a Rust toolchain, or use a release binary/package. |
 | Permission denied opening the virtio port | Apply step 3 for the desktop user and verify device access. |
 | Port missing or service condition skipped | Verify the VM's SPICE channel; start the service again after it appears. |
+| Cannot connect to the X11 server | Check `DISPLAY`, `XAUTHORITY`, and session authentication; run without sudo. |
 | Cannot connect to the Wayland compositor | Run inside the guest session and import its current environment; avoid sudo. |
 | Required data-control protocol unavailable | Check compositor support for `ext-data-control` or `wlr-data-control`. |
 | Service unit not found | Install the service file and run `systemctl --user daemon-reload`. |
@@ -196,7 +224,7 @@ Then restart the service. Other settings can be supplied in the same override, f
 
 ### Clipboard timeouts and recovery
 
-Clipboard payload reads have a total deadline of 2000 ms, including sources that send partial data but never finish. A timed-out read leaves the cached clipboard intact and schedules another attempt after the polling interval (`--poll-ms`, default 250 ms). A fresh selection event supersedes a stalled source's retry delay. The deadline applies to receiving the payload from the clipboard owner; Wayland protocol roundtrips still depend on the compositor responding.
+Clipboard payload reads have a total deadline of 2000 ms, including sources that send partial data but never finish. In X11 this includes selection target negotiation and incremental transfer events. A timed-out read leaves the cached clipboard intact and schedules another attempt after the polling interval (`--poll-ms`, default 250 ms). A fresh selection event supersedes a stalled source's retry delay. The deadline applies to receiving the payload from the clipboard owner; Display connection setup and server roundtrips still depend on the display server responding.
 
 To allow more time for a slow source, set `--clipboard-timeout-ms` when running manually, or add this to your service override:
 
@@ -207,7 +235,7 @@ Environment=PAPRIKA_VDAGENT_CLIPBOARD_TIMEOUT_MS=5000
 
 Restart the service after editing its override. Both the clipboard timeout and polling interval must be greater than zero.
 
-If the event watcher disconnects or its data-control device finishes, the bridge falls back to polling. If the compositor itself is gone or the SPICE transport fails, the bridge exits with an error and the supplied systemd service restarts it. Without systemd, your session supervisor must restart it. A restarted compositor may have a different socket or session environment; run `paprika-vdagent session-start` from the new session to import it.
+If the event watcher disconnects or a Wayland data-control device finishes, the bridge falls back to polling. If the display server itself is gone or the SPICE transport fails, the bridge exits with an error and the supplied systemd service restarts it. Without systemd, your session supervisor must restart it. A restarted compositor may have a different socket or session environment; run `paprika-vdagent session-start` from the new session to import it.
 
 A SPICE client disconnect cancels in-progress file transfers and resets capability negotiation. The visible clipboard stays available in the guest and is announced again after the next client negotiates its clipboard capabilities. Interrupted transfers are removed when cancelled or when the bridge exits normally, including error returns. Termination by a signal (including stopping the service), or a power failure, can leave `.paprika-vdagent-*.part` files; remove these only after stopping the bridge.
 

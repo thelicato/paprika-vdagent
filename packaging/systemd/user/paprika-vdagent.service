@@ -1,5 +1,5 @@
 [Unit]
-Description=Paprika Wayland SPICE clipboard bridge
+Description=Paprika SPICE clipboard bridge
 ConditionPathExists=/dev/virtio-ports/com.redhat.spice.0
 After=graphical-session.target
 PartOf=graphical-session.target

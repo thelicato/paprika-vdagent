@@ -166,3 +166,14 @@ fn bounds_unresponsive_wayland_registry_checks() {
     assert!(started.elapsed() < Duration::from_secs(10));
     server.join().unwrap();
 }
+
+#[test]
+fn x11_backend_reports_its_missing_display_without_a_wayland_check() {
+    let fixture = Fixture::new("exit 1");
+    let output = fixture.run(fixture.command().args(["--backend", "x11", "doctor"]));
+    assert!(!output.status.success());
+    let report = String::from_utf8(output.stdout).unwrap();
+    assert!(report.contains("[FAIL] X11 connection failed"));
+    assert!(report.contains("DISPLAY and XAUTHORITY"));
+    assert!(!report.contains("Wayland connection failed"));
+}

@@ -73,7 +73,7 @@ Technically, a custom Wayland agent could talk to `/run/spice-vdagentd/spice-vda
 
 The SPICE bridge uses the `Clipboard` interface for reading, writing, clearing, selection capabilities, and starting a change watcher. Backends report `ClipboardEvent` notifications and return `ClipboardRead::Ready` for completed reads or `ClipboardRead::Retry` when the cached selection should be retained. The bridge owns clipboard caches, echo suppression, retry scheduling, SPICE negotiation, and file transfers independently of the display connection.
 
-`WaylandClipboard` is currently the implementation. It keeps the existing data-control protocols, selection support, payload deadline, and watcher fallback. Adding another backend does not require changing the clipboard ownership flow or SPICE transport.
+`WaylandClipboard` and `X11Clipboard` implement this interface. Wayland remains the default and X11 is selected explicitly with `--backend x11`. The Wayland backend keeps the existing data-control protocols, selection support, payload deadline, and watcher fallback. Adding another backend does not require changing the clipboard ownership flow or SPICE transport.
 
 ## Wayland backend
 
@@ -93,6 +93,20 @@ Payload reads use a non-blocking pipe and a total deadline, configured by `--cli
 On SPICE client disconnect, transport capabilities and serial state are reset, in-progress file transfers are cancelled, and the visible clipboard is retained as guest-owned data for the next client's capability negotiation. Temporary downloads are removed on cancellation, transfer errors, and normal Rust resource cleanup, including an error exit. Termination by a signal and power loss can leave temporary files.
 
 Regular clipboard and primary selection are both supported in the current implementation. Secondary selection is still intentionally unsupported.
+
+## X11 backend
+
+The native X11 backend uses `x11rb` with separate display connections for ownership serving and selection reads. An unmapped owner window and a background service keep host-provided text available while the bridge reads selections, handles SPICE traffic, or receives files. Commands wake the service through a pipe; XFixes selection notifications feed the same clipboard event channel as Wayland. If XFixes is unavailable, the bridge polls while the owner service continues answering requests. `--poll-only` explicitly selects polling on either backend.
+
+Both `CLIPBOARD` and `PRIMARY` are supported. The backend negotiates text targets, prefers UTF-8, and converts legacy Latin-1 `STRING` data to UTF-8. It serves `TARGETS`, `TIMESTAMP`, and `MULTIPLE`, alongside `UTF8_STRING`, `TEXT`, `STRING` where representable, and plain-text MIME targets. It does not decode `COMPOUND_TEXT`.
+
+Selection ownership uses server timestamps. Clearing checks the current owner and uses the acquisition timestamp so a later owner's clipboard is not released. Incremental transfers retain a snapshot of the requested data, allowing an existing transfer to finish after ownership changes.
+
+Incoming reads use a dedicated request window and a total selection-transfer deadline. Byte limits apply to direct and incremental transfers, including UTF-8 expansion after Latin-1 conversion. Oversized incremental data is discarded while completing the handshake within the remaining deadline; it is not accumulated. Timeouts, invalid text, and exceeded limits preserve the bridge's cache and schedule retries. Closing the read connection removes its request window and temporary properties.
+
+Outgoing incremental transfers use chunks of at most 64 KiB, respect the server's request-size limit, and have a total deadline. At most 32 incremental transfers may be active. A vanished requestor or expired deadline releases its transfer state and property-event subscription. Display-server connection setup and synchronous replies are not covered by the selection payload deadline.
+
+The implementation follows the [ICCCM selection conventions](https://xorg.freedesktop.org/releases/current/doc/xorg-docs/icccm/icccm.html) and uses [x11rb](https://github.com/psychon/x11rb) for X11 and XFixes protocol access.
 
 ## SPICE protocol subset implemented in v1
 

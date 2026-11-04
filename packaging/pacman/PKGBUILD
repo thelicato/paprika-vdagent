@@ -4,7 +4,7 @@
 pkgname=paprika-vdagent
 pkgver=0.1.1
 pkgrel=1
-pkgdesc="Standalone Wayland SPICE clipboard bridge for Linux guests"
+pkgdesc="Standalone X11 and Wayland SPICE clipboard bridge for Linux guests"
 arch=('x86_64' 'aarch64')
 url=''
 license=('GPL-3.0-only')
@@ -12,7 +12,8 @@ depends=('glibc' 'wayland')
 makedepends=('cargo' 'pkgconf')
 optdepends=(
   'acl: grant a desktop user access to /dev/virtio-ports/com.redhat.spice.0'
-  'wl-clipboard: manual clipboard testing tools'
+  'wl-clipboard: manual Wayland clipboard testing tools'
+  'xsel: manual X11 clipboard testing tools'
 )
 install='paprika-vdagent.install'
 source=()

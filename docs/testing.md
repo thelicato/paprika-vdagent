@@ -12,7 +12,7 @@ cargo clippy --locked --all-targets
 
 The standard suite covers protocol parsing and framing, transfer cancellation and cleanup, clipboard payload deadlines, cached clipboard state, startup commands, and diagnostics. Some tests create private Unix sockets and may need to run outside a restrictive sandbox. They do not require a desktop session or access to a real SPICE device.
 
-## Full-bridge integration tests
+## Wayland full-bridge integration tests
 
 Install Sway and `wl-clipboard` using your distribution's package manager. The suite needs `sway`, `wl-copy`, and `wl-paste` on `PATH`. For example, on Arch Linux or CachyOS:
 
@@ -59,3 +59,27 @@ PAPRIKA_TEST_SWAY=/path/to/sway cargo test --locked --test bridge -- --ignored
 The `clipboard_source_helper` test is an internal subprocess entry point. It does nothing during a normal test run and serves the deliberately stalled source only when invoked by an integration fixture.
 
 These tests exercise local bridge behaviour with the protocols advertised by the installed Sway version. They do not replace testing against a real SPICE viewer, virtio driver, or other compositors. Systemd restart policies and compositor-specific session startup should also be verified in a guest VM.
+
+## X11 full-bridge integration tests
+
+Install Xvfb and `xsel` using your distribution's package manager. On Arch Linux or CachyOS:
+
+```sh
+sudo pacman -S --needed xorg-server-xvfb xsel
+```
+
+Run the native X11 scenarios explicitly:
+
+```sh
+cargo test --locked --test x11 -- --ignored
+```
+
+Each fixture starts an authenticated Xvfb server with an automatically allocated display number and TCP disabled. Clients use a private authority file containing a random cookie. The real Paprika binary runs with `--backend x11`, a raw pseudoterminal for SPICE, and a private download directory. Tests use `xsel` and independent X11 protocol clients for clipboard requests; no live display or authentication environment is inherited. The `doctor` scenario substitutes a private systemctl stub and checks the fixture's port.
+
+The suite covers both selections, UTF-8 and Latin-1 text, large incremental transfers in both directions, ownership changes, echo suppression, `TARGETS`, `TIMESTAMP`, `MULTIPLE`, explicit polling, SPICE client reconnection, selection and INCR timeouts, oversized data, vanished requestors, and cleanup after X11 or transport failure. The polling scenario uses `--poll-only` and leaves XFixes enabled in Xvfb; it exercises explicit polling independently of extension availability.
+
+Set `PAPRIKA_TEST_XVFB` to use an Xvfb executable or wrapper outside `PATH`. The same environment isolation and test deadlines as the Wayland suite apply. Fixtures terminate and reap the server so it can remove its display socket and lock.
+
+```sh
+PAPRIKA_TEST_XVFB=/path/to/Xvfb cargo test --locked --test x11 -- --ignored
+```

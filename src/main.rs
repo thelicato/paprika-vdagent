@@ -9,6 +9,7 @@ mod session;
 mod spice;
 mod wayland;
 mod wayland_watch;
+mod x11;
 
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
@@ -16,7 +17,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use clipboard::{Clipboard, ClipboardEvent, ClipboardRead};
 use file_transfer::FileTransferManager;
 use selection::ClipboardSelection;
@@ -31,6 +32,10 @@ struct Cli {
     #[command(subcommand)]
     command: Option<CliCommand>,
 
+    /// Session clipboard backend
+    #[arg(long, env = "PAPRIKA_VDAGENT_BACKEND", value_enum, default_value_t = Backend::Wayland)]
+    backend: Backend,
+
     #[arg(
         long,
         env = "PAPRIKA_VDAGENT_PORT",
@@ -40,6 +45,10 @@ struct Cli {
 
     #[arg(long, env = "PAPRIKA_VDAGENT_POLL_MS", default_value_t = 250, value_parser = clap::value_parser!(u64).range(1..))]
     poll_ms: u64,
+
+    /// Poll clipboard changes instead of using native change notifications
+    #[arg(long, env = "PAPRIKA_VDAGENT_POLL_ONLY", default_value_t = false)]
+    poll_only: bool,
 
     #[arg(long, env = "PAPRIKA_VDAGENT_MAX_TEXT_BYTES", default_value_t = 1024 * 1024)]
     max_text_bytes: usize,
@@ -60,6 +69,12 @@ struct Cli {
         default_value_t = 8
     )]
     max_active_file_transfers: usize,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum Backend {
+    Wayland,
+    X11,
 }
 
 #[derive(Debug, Subcommand)]
@@ -147,8 +162,14 @@ fn main() -> Result<()> {
     init_logging();
     let cli = Cli::parse();
     match cli.command {
-        Some(CliCommand::SessionStart) => session::start(),
+        Some(CliCommand::SessionStart) => match cli.backend {
+            Backend::Wayland => session::start(),
+            Backend::X11 => bail!(
+                "for X11, start `paprika-vdagent --backend x11` from your session; session-start currently requires Wayland"
+            ),
+        },
         Some(CliCommand::Doctor) => doctor::run(
+            cli.backend,
             &cli.virtio_port,
             cli.seat.as_deref(),
             cli.file_dir.as_deref(),
@@ -158,17 +179,24 @@ fn main() -> Result<()> {
 }
 
 fn run(cli: Cli) -> Result<()> {
-    let seat = cli
-        .seat
-        .as_ref()
-        .map(|seat| SeatSelector::Specific(seat.clone()))
-        .unwrap_or(SeatSelector::Unspecified);
-    let clipboard = WaylandClipboard::new(
-        cli.max_text_bytes,
-        seat,
-        Duration::from_millis(cli.clipboard_timeout_ms),
-    )?;
-    run_bridge(cli, &clipboard)
+    let timeout = Duration::from_millis(cli.clipboard_timeout_ms);
+    let clipboard: Box<dyn Clipboard> = match cli.backend {
+        Backend::Wayland => {
+            let seat = cli
+                .seat
+                .as_ref()
+                .map(|name| SeatSelector::Specific(name.clone()))
+                .unwrap_or(SeatSelector::Unspecified);
+            Box::new(WaylandClipboard::new(cli.max_text_bytes, seat, timeout)?)
+        }
+        Backend::X11 => {
+            if cli.seat.is_some() {
+                bail!("--seat applies only to Wayland; remove it when selecting the X11 backend");
+            }
+            Box::new(x11::X11Clipboard::new(cli.max_text_bytes, timeout)?)
+        }
+    };
+    run_bridge(cli, clipboard.as_ref())
 }
 
 fn run_bridge(cli: Cli, clipboard: &dyn Clipboard) -> Result<()> {
@@ -191,17 +219,21 @@ fn run_bridge(cli: Cli, clipboard: &dyn Clipboard) -> Result<()> {
     let mut state = BridgeState::default();
     let mut watcher_active = false;
 
-    match spawn_clipboard_forwarder(clipboard, bridge_tx.clone()) {
-        Ok(()) => {
-            watcher_active = true;
-            info!("using event-driven {} clipboard watching", clipboard.name());
-        }
-        Err(err) => {
-            warn!(
-                "failed to start event-driven {} watcher: {err:#}; falling back to polling every {} ms",
-                clipboard.name(),
-                cli.poll_ms
-            );
+    if cli.poll_only {
+        info!("using clipboard polling every {} ms", cli.poll_ms);
+    } else {
+        match spawn_clipboard_forwarder(clipboard, bridge_tx.clone()) {
+            Ok(()) => {
+                watcher_active = true;
+                info!("using event-driven {} clipboard watching", clipboard.name());
+            }
+            Err(err) => {
+                warn!(
+                    "failed to start event-driven {} watcher: {err:#}; falling back to polling every {} ms",
+                    clipboard.name(),
+                    cli.poll_ms
+                );
+            }
         }
     }
 
@@ -694,6 +726,18 @@ mod recovery_tests {
         assert!(state.clipboard.suppress_text.is_none());
         assert!(!state.primary.suppress_empty);
         assert_eq!(state.primary.owner, ClipboardOwner::Empty);
+    }
+
+    #[test]
+    fn backend_and_polling_options_parse_explicitly() {
+        let cli =
+            Cli::try_parse_from(["paprika-vdagent", "--backend", "x11", "--poll-only"]).unwrap();
+        assert!(matches!(cli.backend, Backend::X11));
+        assert!(cli.poll_only);
+        let cli = Cli::try_parse_from(["paprika-vdagent", "--backend", "wayland"]).unwrap();
+        assert!(matches!(cli.backend, Backend::Wayland));
+        assert!(!cli.poll_only);
+        assert!(Cli::try_parse_from(["paprika-vdagent", "--backend", "unsupported"]).is_err());
     }
 
     #[test]

@@ -60,9 +60,40 @@ impl Report {
     }
 }
 
-pub fn run(port: &Path, seat: Option<&str>, file_dir: Option<&Path>) -> Result<()> {
+pub fn run(
+    backend: crate::Backend,
+    port: &Path,
+    seat: Option<&str>,
+    file_dir: Option<&Path>,
+) -> Result<()> {
     let mut report = Report::default();
-    check_wayland(&mut report, seat);
+    match backend {
+        crate::Backend::Wayland => check_wayland(&mut report, seat),
+        crate::Backend::X11 => {
+            if seat.is_some() {
+                report.add(
+                    Level::Fail,
+                    "--seat applies only to Wayland; remove it when selecting the X11 backend.",
+                );
+            }
+            let (sender, receiver) = mpsc::sync_channel(1);
+            thread::spawn(move || {
+                let _ = sender.send(crate::x11::probe());
+            });
+            match receiver.recv_timeout(CHECK_TIMEOUT) {
+                Ok(Ok(xfixes)) => {
+                    report.add(Level::Ok, "Connected to the X11 server; CLIPBOARD and PRIMARY selections are available.");
+                    if xfixes {
+                        report.add(Level::Ok, "XFixes selection notifications are available.");
+                    } else {
+                        report.add(Level::Warn, "XFixes selection notifications are unavailable; the bridge will poll the clipboard.");
+                    }
+                }
+                Ok(Err(error)) => report.add(Level::Fail, format!("X11 connection failed: {error:#}. Run doctor inside your X11 session without sudo.")),
+                Err(error) => report.add(Level::Fail, format!("X11 diagnostics did not complete: {error}. Check that the X server is responding.")),
+            }
+        }
+    }
     check_port(&mut report, port);
     check_agents(&mut report, Path::new("/proc"));
     let directory = file_dir
