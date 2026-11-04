@@ -69,6 +69,12 @@ Technically, a custom Wayland agent could talk to `/run/spice-vdagentd/spice-vda
 6. When the expected byte count has been received, the bridge renames the temporary file into place and replies with `VD_AGENT_FILE_XFER_STATUS_SUCCESS`.
 7. If the host cancels the transfer or a local write fails, the bridge removes the temporary file and reports an error or cancellation back to the host.
 
+## Clipboard backend interface
+
+The SPICE bridge uses the `Clipboard` interface for reading, writing, clearing, selection capabilities, and starting a change watcher. Backends report `ClipboardEvent` notifications and return `ClipboardRead::Ready` for completed reads or `ClipboardRead::Retry` when the cached selection should be retained. The bridge owns clipboard caches, echo suppression, retry scheduling, SPICE negotiation, and file transfers independently of the display connection.
+
+`WaylandClipboard` is currently the implementation. It keeps the existing data-control protocols, selection support, payload deadline, and watcher fallback. Adding another backend does not require changing the clipboard ownership flow or SPICE transport.
+
 ## Wayland backend
 
 The prototype uses `wl-clipboard-rs` as the Wayland backend.

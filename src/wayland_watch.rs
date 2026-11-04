@@ -19,14 +19,9 @@ use wayland_protocols_wlr::data_control::v1::client::zwlr_data_control_device_v1
 use wayland_protocols_wlr::data_control::v1::client::zwlr_data_control_manager_v1::ZwlrDataControlManagerV1;
 use wayland_protocols_wlr::data_control::v1::client::zwlr_data_control_offer_v1::ZwlrDataControlOfferV1;
 
+use crate::clipboard::ClipboardEvent;
 use crate::selection::ClipboardSelection;
 use crate::wayland::SeatSelector;
-
-#[derive(Debug)]
-pub enum WatchEvent {
-    SelectionChanged(ClipboardSelection),
-    Disconnected(String),
-}
 
 #[derive(Clone)]
 enum WatchManager {
@@ -82,7 +77,7 @@ impl WatchDevice {
     }
 }
 
-pub fn spawn_selection_watcher(seat: SeatSelector, sender: Sender<WatchEvent>) -> Result<()> {
+pub fn spawn_selection_watcher(seat: SeatSelector, sender: Sender<ClipboardEvent>) -> Result<()> {
     let (startup_tx, startup_rx) = mpsc::sync_channel(1);
 
     thread::Builder::new()
@@ -93,7 +88,7 @@ pub fn spawn_selection_watcher(seat: SeatSelector, sender: Sender<WatchEvent>) -
 
                 if let Err(err) = watch_loop(&mut queue, &mut state) {
                     let message = format!("{err:#}");
-                    let _ = sender.send(WatchEvent::Disconnected(message));
+                    let _ = sender.send(ClipboardEvent::Disconnected(message));
                 }
             }
             Err(err) => {
@@ -122,7 +117,7 @@ fn notify_startup(startup_tx: &SyncSender<Result<(), String>>, result: Result<()
 
 fn initialize_watcher(
     seat: SeatSelector,
-    sender: Sender<WatchEvent>,
+    sender: Sender<ClipboardEvent>,
 ) -> Result<(EventQueue<WatchState>, WatchState)> {
     let conn = Connection::connect_to_env().context("failed to connect to Wayland compositor")?;
     let (globals, mut queue) = registry_queue_init::<WatchState>(&conn)
@@ -214,7 +209,7 @@ impl SeatState {
 
 struct WatchState {
     seat: SeatSelector,
-    sender: Sender<WatchEvent>,
+    sender: Sender<ClipboardEvent>,
     seats: HashMap<WlSeat, SeatState>,
     armed: bool,
     finished: bool,
@@ -303,9 +298,9 @@ impl Dispatch<ZwlrDataControlDeviceV1, WlSeat> for WatchState {
                 }
                 if state.armed && state.should_notify(seat) {
                     debug!("Wayland clipboard selection changed");
-                    let _ = state
-                        .sender
-                        .send(WatchEvent::SelectionChanged(ClipboardSelection::Clipboard));
+                    let _ = state.sender.send(ClipboardEvent::SelectionChanged(
+                        ClipboardSelection::Clipboard,
+                    ));
                 }
             }
             zwlr_data_control_device_v1::Event::PrimarySelection { id } => {
@@ -314,9 +309,9 @@ impl Dispatch<ZwlrDataControlDeviceV1, WlSeat> for WatchState {
                 }
                 if state.armed && state.should_notify(seat) {
                     debug!("Wayland primary selection changed");
-                    let _ = state
-                        .sender
-                        .send(WatchEvent::SelectionChanged(ClipboardSelection::Primary));
+                    let _ = state.sender.send(ClipboardEvent::SelectionChanged(
+                        ClipboardSelection::Primary,
+                    ));
                 }
             }
             zwlr_data_control_device_v1::Event::Finished => {
@@ -353,9 +348,9 @@ impl Dispatch<ExtDataControlDeviceV1, WlSeat> for WatchState {
                 }
                 if state.armed && state.should_notify(seat) {
                     debug!("Wayland clipboard selection changed");
-                    let _ = state
-                        .sender
-                        .send(WatchEvent::SelectionChanged(ClipboardSelection::Clipboard));
+                    let _ = state.sender.send(ClipboardEvent::SelectionChanged(
+                        ClipboardSelection::Clipboard,
+                    ));
                 }
             }
             ext_data_control_device_v1::Event::PrimarySelection { id } => {
@@ -364,9 +359,9 @@ impl Dispatch<ExtDataControlDeviceV1, WlSeat> for WatchState {
                 }
                 if state.armed && state.should_notify(seat) {
                     debug!("Wayland primary selection changed");
-                    let _ = state
-                        .sender
-                        .send(WatchEvent::SelectionChanged(ClipboardSelection::Primary));
+                    let _ = state.sender.send(ClipboardEvent::SelectionChanged(
+                        ClipboardSelection::Primary,
+                    ));
                 }
             }
             ext_data_control_device_v1::Event::Finished => {

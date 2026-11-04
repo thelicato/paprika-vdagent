@@ -1,5 +1,6 @@
 use std::fmt;
 use std::io;
+use std::sync::mpsc::Sender;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -14,8 +15,10 @@ use wl_clipboard_rs::paste::{
 };
 use wl_clipboard_rs::utils::{PrimarySelectionCheckError, is_primary_selection_supported};
 
+use crate::clipboard::{Clipboard, ClipboardEvent, ClipboardRead};
 use crate::clipboard_io::read_clipboard_bytes;
 use crate::selection::ClipboardSelection;
+use crate::wayland_watch::spawn_selection_watcher;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SeatSelector {
@@ -48,12 +51,6 @@ impl fmt::Display for SeatSelector {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub enum ClipboardRead {
-    Ready(Option<String>),
-    Retry,
-}
-
 pub struct WaylandClipboard {
     read_timeout: Duration,
     max_text_bytes: usize,
@@ -73,7 +70,35 @@ impl WaylandClipboard {
         Ok(clipboard)
     }
 
-    pub fn read_text(&self, selection: ClipboardSelection) -> Result<ClipboardRead> {
+    fn probe(&self) -> Result<()> {
+        // Probe the protocol and seat without asking a clipboard owner for data.
+        match get_mime_types(PasteClipboardType::Regular, self.seat.paste_seat()) {
+            Ok(_) | Err(PasteError::ClipboardEmpty | PasteError::NoMimeType) => Ok(()),
+            Err(err) => Err(err).context("failed to probe Wayland clipboard"),
+        }
+    }
+
+    fn copy_clipboard_type(&self, selection: ClipboardSelection) -> CopyClipboardType {
+        match selection {
+            ClipboardSelection::Clipboard => CopyClipboardType::Regular,
+            ClipboardSelection::Primary => CopyClipboardType::Primary,
+        }
+    }
+
+    fn paste_clipboard_type(&self, selection: ClipboardSelection) -> PasteClipboardType {
+        match selection {
+            ClipboardSelection::Clipboard => PasteClipboardType::Regular,
+            ClipboardSelection::Primary => PasteClipboardType::Primary,
+        }
+    }
+}
+
+impl Clipboard for WaylandClipboard {
+    fn name(&self) -> &'static str {
+        "Wayland"
+    }
+
+    fn read_text(&self, selection: ClipboardSelection) -> Result<ClipboardRead> {
         if !self.selection_supported(selection) {
             return Ok(ClipboardRead::Ready(None));
         }
@@ -126,7 +151,7 @@ impl WaylandClipboard {
         }
     }
 
-    pub fn write_text(&self, selection: ClipboardSelection, text: &str) -> Result<bool> {
+    fn write_text(&self, selection: ClipboardSelection, text: &str) -> Result<bool> {
         if !self.selection_supported(selection) {
             return Ok(false);
         }
@@ -153,7 +178,7 @@ impl WaylandClipboard {
         Ok(true)
     }
 
-    pub fn clear(&self, selection: ClipboardSelection) -> Result<bool> {
+    fn clear(&self, selection: ClipboardSelection) -> Result<bool> {
         if !self.selection_supported(selection) {
             return Ok(false);
         }
@@ -164,37 +189,16 @@ impl WaylandClipboard {
         Ok(true)
     }
 
-    pub fn seat(&self) -> &SeatSelector {
-        &self.seat
-    }
-
-    pub fn selection_supported(&self, selection: ClipboardSelection) -> bool {
+    fn selection_supported(&self, selection: ClipboardSelection) -> bool {
         match selection {
             ClipboardSelection::Clipboard => true,
             ClipboardSelection::Primary => self.primary_supported,
         }
     }
 
-    fn probe(&self) -> Result<()> {
-        // Probe the protocol and seat without asking a clipboard owner for data.
-        match get_mime_types(PasteClipboardType::Regular, self.seat.paste_seat()) {
-            Ok(_) | Err(PasteError::ClipboardEmpty | PasteError::NoMimeType) => Ok(()),
-            Err(err) => Err(err).context("failed to probe Wayland clipboard"),
-        }
-    }
-
-    fn copy_clipboard_type(&self, selection: ClipboardSelection) -> CopyClipboardType {
-        match selection {
-            ClipboardSelection::Clipboard => CopyClipboardType::Regular,
-            ClipboardSelection::Primary => CopyClipboardType::Primary,
-        }
-    }
-
-    fn paste_clipboard_type(&self, selection: ClipboardSelection) -> PasteClipboardType {
-        match selection {
-            ClipboardSelection::Clipboard => PasteClipboardType::Regular,
-            ClipboardSelection::Primary => PasteClipboardType::Primary,
-        }
+    fn start_watcher(&self, sender: Sender<ClipboardEvent>) -> Result<()> {
+        tracing::info!("starting Wayland clipboard watcher on seat {}", self.seat);
+        spawn_selection_watcher(self.seat.clone(), sender)
     }
 }
 

@@ -1,4 +1,7 @@
+mod clipboard;
 mod clipboard_io;
+#[cfg(test)]
+mod clipboard_tests;
 mod doctor;
 mod file_transfer;
 mod selection;
@@ -14,13 +17,13 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use clipboard::{Clipboard, ClipboardEvent, ClipboardRead};
 use file_transfer::FileTransferManager;
 use selection::ClipboardSelection;
 use spice::{PeerCapabilities, SpiceTransport, TransportEvent, VD_AGENT_CLIPBOARD_UTF8_TEXT};
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
-use wayland::{ClipboardRead, SeatSelector, WaylandClipboard};
-use wayland_watch::{WatchEvent, spawn_selection_watcher};
+use wayland::{SeatSelector, WaylandClipboard};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
@@ -80,7 +83,7 @@ struct SelectionState {
     owner: ClipboardOwner,
     guest_cache: Option<String>,
     host_cache: Option<String>,
-    last_wayland_text: Option<String>,
+    last_clipboard_text: Option<String>,
     suppress_text: Option<String>,
     suppress_empty: bool,
     retry_since: Option<Instant>,
@@ -96,8 +99,8 @@ struct BridgeState {
 
 enum BridgeEvent {
     Transport(TransportEvent),
-    WaylandSelectionChanged(ClipboardSelection),
-    WaylandWatcherDisconnected(String),
+    SelectionChanged(ClipboardSelection),
+    ClipboardWatcherDisconnected(String),
 }
 
 impl Default for ClipboardOwner {
@@ -113,7 +116,7 @@ impl BridgeState {
             let state = self.selection_state_mut(selection);
             // Keep the visible clipboard available to the guest and announce it
             // as local data when a new client negotiates its capabilities.
-            state.guest_cache = state.last_wayland_text.clone();
+            state.guest_cache = state.last_clipboard_text.clone();
             state.owner = if state.guest_cache.is_some() {
                 ClipboardOwner::Guest
             } else {
@@ -162,15 +165,20 @@ fn run(cli: Cli) -> Result<()> {
         .unwrap_or(SeatSelector::Unspecified);
     let clipboard = WaylandClipboard::new(
         cli.max_text_bytes,
-        seat.clone(),
+        seat,
         Duration::from_millis(cli.clipboard_timeout_ms),
     )?;
+    run_bridge(cli, &clipboard)
+}
+
+fn run_bridge(cli: Cli, clipboard: &dyn Clipboard) -> Result<()> {
     let mut file_transfers =
         FileTransferManager::new(cli.file_dir.clone(), Some(cli.max_active_file_transfers))?;
 
     if !clipboard.selection_supported(ClipboardSelection::Primary) {
         info!(
-            "Wayland primary selection is not supported by this compositor; primary sync is disabled"
+            "{} primary selection is not supported; primary sync is disabled",
+            clipboard.name()
         );
     }
 
@@ -183,17 +191,15 @@ fn run(cli: Cli) -> Result<()> {
     let mut state = BridgeState::default();
     let mut watcher_active = false;
 
-    match spawn_wayland_forwarder(seat, bridge_tx.clone()) {
+    match spawn_clipboard_forwarder(clipboard, bridge_tx.clone()) {
         Ok(()) => {
             watcher_active = true;
-            info!(
-                "using event-driven Wayland clipboard watching on seat {}",
-                clipboard.seat()
-            );
+            info!("using event-driven {} clipboard watching", clipboard.name());
         }
         Err(err) => {
             warn!(
-                "failed to start event-driven Wayland watcher: {err:#}; falling back to polling every {} ms",
+                "failed to start event-driven {} watcher: {err:#}; falling back to polling every {} ms",
+                clipboard.name(),
                 cli.poll_ms
             );
         }
@@ -201,7 +207,7 @@ fn run(cli: Cli) -> Result<()> {
 
     for selection in ClipboardSelection::ALL {
         let snapshot = clipboard.read_text(selection)?;
-        handle_wayland_read(&transport, &mut state, selection, snapshot)?;
+        handle_clipboard_read(&transport, &mut state, selection, snapshot)?;
     }
 
     let poll_interval = Duration::from_millis(cli.poll_ms);
@@ -215,9 +221,9 @@ fn run(cli: Cli) -> Result<()> {
         info!("file transfer support is disabled");
     }
     info!(
-        "starting bridge loop on {} (seat={}, poll fallback={} ms)",
+        "starting bridge loop on {} (backend={}, poll fallback={} ms)",
         cli.virtio_port.display(),
-        clipboard.seat(),
+        clipboard.name(),
         cli.poll_ms
     );
 
@@ -227,7 +233,7 @@ fn run(cli: Cli) -> Result<()> {
             Ok(event) => {
                 handle_bridge_event(
                     &transport,
-                    &clipboard,
+                    clipboard,
                     &mut state,
                     &mut file_transfers,
                     event,
@@ -237,7 +243,7 @@ fn run(cli: Cli) -> Result<()> {
                 for event in bridge_rx.try_iter().take(64) {
                     handle_bridge_event(
                         &transport,
-                        &clipboard,
+                        clipboard,
                         &mut state,
                         &mut file_transfers,
                         event,
@@ -260,7 +266,7 @@ fn run(cli: Cli) -> Result<()> {
                     .is_none_or(|since| since.elapsed() >= poll_interval);
             if (!watcher_active && poll_due) || read_due {
                 let snapshot = clipboard.read_text(selection)?;
-                handle_wayland_read(&transport, &mut state, selection, snapshot)?;
+                handle_clipboard_read(&transport, &mut state, selection, snapshot)?;
             }
         }
         if poll_due {
@@ -287,20 +293,23 @@ fn spawn_transport_forwarder(
     Ok(())
 }
 
-fn spawn_wayland_forwarder(seat: SeatSelector, tx: mpsc::Sender<BridgeEvent>) -> Result<()> {
+fn spawn_clipboard_forwarder(
+    clipboard: &dyn Clipboard,
+    tx: mpsc::Sender<BridgeEvent>,
+) -> Result<()> {
     let (watch_tx, watch_rx) = mpsc::channel();
-    spawn_selection_watcher(seat, watch_tx)?;
+    clipboard.start_watcher(watch_tx)?;
 
     thread::Builder::new()
         .name("paprika-watch-forward".to_string())
         .spawn(move || {
             while let Ok(event) = watch_rx.recv() {
                 let bridge_event = match event {
-                    WatchEvent::SelectionChanged(selection) => {
-                        BridgeEvent::WaylandSelectionChanged(selection)
+                    ClipboardEvent::SelectionChanged(selection) => {
+                        BridgeEvent::SelectionChanged(selection)
                     }
-                    WatchEvent::Disconnected(message) => {
-                        BridgeEvent::WaylandWatcherDisconnected(message)
+                    ClipboardEvent::Disconnected(message) => {
+                        BridgeEvent::ClipboardWatcherDisconnected(message)
                     }
                 };
 
@@ -309,14 +318,14 @@ fn spawn_wayland_forwarder(seat: SeatSelector, tx: mpsc::Sender<BridgeEvent>) ->
                 }
             }
         })
-        .context("failed to spawn Wayland watcher forwarder")?;
+        .context("failed to spawn clipboard watcher forwarder")?;
 
     Ok(())
 }
 
 fn handle_bridge_event(
     transport: &SpiceTransport,
-    clipboard: &WaylandClipboard,
+    clipboard: &dyn Clipboard,
     state: &mut BridgeState,
     file_transfers: &mut FileTransferManager,
     event: BridgeEvent,
@@ -363,14 +372,14 @@ fn handle_bridge_event(
                     let should_clear = {
                         let selection_state = state.selection_state(selection);
                         selection_state.owner == ClipboardOwner::Host
-                            && selection_state.last_wayland_text.is_some()
+                            && selection_state.last_clipboard_text.is_some()
                     };
 
                     if should_clear {
                         let _ = clipboard.clear(selection)?;
                         let selection_state = state.selection_state_mut(selection);
                         selection_state.suppress_empty = true;
-                        selection_state.last_wayland_text = None;
+                        selection_state.last_clipboard_text = None;
                         selection_state.host_cache = None;
                     }
 
@@ -396,7 +405,7 @@ fn handle_bridge_event(
                 if let Some(text) = selection_state
                     .guest_cache
                     .as_deref()
-                    .or(selection_state.last_wayland_text.as_deref())
+                    .or(selection_state.last_clipboard_text.as_deref())
                 {
                     transport.send_clipboard_text(selection, text)?;
                 } else {
@@ -418,13 +427,15 @@ fn handle_bridge_event(
                     .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned());
 
                 info!(
-                    "received host {selection} text ({} bytes), injecting into Wayland",
-                    text.len()
+                    "received host {selection} text ({} bytes), injecting into {}",
+                    text.len(),
+                    clipboard.name()
                 );
 
                 if !clipboard.write_text(selection, &text)? {
                     warn!(
-                        "guest compositor does not support Wayland {selection}; ignoring incoming host data"
+                        "{} backend does not support {selection}; ignoring incoming host data",
+                        clipboard.name()
                     );
                     return Ok(());
                 }
@@ -434,7 +445,7 @@ fn handle_bridge_event(
                 selection_state.guest_cache = None;
                 selection_state.host_cache = Some(text.clone());
                 selection_state.suppress_text = Some(text.clone());
-                selection_state.last_wayland_text = Some(text);
+                selection_state.last_clipboard_text = Some(text);
             }
             TransportEvent::HostRelease { selection } => {
                 info!("host released {selection} ownership");
@@ -447,7 +458,7 @@ fn handle_bridge_event(
                             .as_ref()
                             .and_then(|released_text| {
                                 selection_state
-                                    .last_wayland_text
+                                    .last_clipboard_text
                                     .as_ref()
                                     .map(|current| current == released_text)
                             })
@@ -461,10 +472,10 @@ fn handle_bridge_event(
                     if cleared {
                         selection_state.suppress_empty = true;
                     }
-                    selection_state.last_wayland_text = None;
+                    selection_state.last_clipboard_text = None;
                     selection_state.owner = ClipboardOwner::Empty;
                     info!(
-                        "cleared Wayland {selection} because the active host-owned text was released"
+                        "cleared local {selection} because the active host-owned text was released"
                     );
                 } else {
                     let _ = released_text;
@@ -489,14 +500,14 @@ fn handle_bridge_event(
                 bail!("SPICE transport disconnected: {message}");
             }
         },
-        BridgeEvent::WaylandSelectionChanged(selection) => {
+        BridgeEvent::SelectionChanged(selection) => {
             // Coalesce selection events before reading. A new owner also
             // supersedes a stalled source's retry delay.
             let selection_state = state.selection_state_mut(selection);
             selection_state.read_pending = true;
             selection_state.retry_since = None;
         }
-        BridgeEvent::WaylandWatcherDisconnected(message) => {
+        BridgeEvent::ClipboardWatcherDisconnected(message) => {
             warn!("{message}; switching back to polling mode");
             *watcher_active = false;
         }
@@ -505,7 +516,7 @@ fn handle_bridge_event(
     Ok(())
 }
 
-fn handle_wayland_read(
+fn handle_clipboard_read(
     transport: &SpiceTransport,
     state: &mut BridgeState,
     selection: ClipboardSelection,
@@ -516,7 +527,7 @@ fn handle_wayland_read(
             let selection_state = state.selection_state_mut(selection);
             selection_state.read_pending = false;
             selection_state.retry_since = None;
-            handle_wayland_snapshot(transport, state, selection, contents)
+            handle_clipboard_snapshot(transport, state, selection, contents)
         }
         ClipboardRead::Retry => {
             let selection_state = state.selection_state_mut(selection);
@@ -527,7 +538,7 @@ fn handle_wayland_read(
     }
 }
 
-fn handle_wayland_snapshot(
+fn handle_clipboard_snapshot(
     transport: &SpiceTransport,
     state: &mut BridgeState,
     selection: ClipboardSelection,
@@ -541,39 +552,39 @@ fn handle_wayland_snapshot(
 
     match snapshot {
         Some(text) => {
-            if selection_state.last_wayland_text.as_ref() == Some(&text) {
+            if selection_state.last_clipboard_text.as_ref() == Some(&text) {
                 return Ok(());
             }
 
             if suppress_text.as_ref() == Some(&text) {
-                debug!("suppressed host->guest {selection} echo for matching Wayland text");
-                selection_state.last_wayland_text = Some(text);
+                debug!("suppressed host->guest {selection} echo for matching local text");
+                selection_state.last_clipboard_text = Some(text);
                 return Ok(());
             }
 
-            info!("guest Wayland {selection} changed ({} bytes)", text.len());
+            info!("guest {selection} changed ({} bytes)", text.len());
             selection_state.owner = ClipboardOwner::Guest;
             selection_state.guest_cache = Some(text.clone());
             selection_state.host_cache = None;
-            selection_state.last_wayland_text = Some(text);
+            selection_state.last_clipboard_text = Some(text);
 
             let _ = transport.send_clipboard_grab_text(selection)?;
         }
         None => {
-            if selection_state.last_wayland_text.is_none() {
+            if selection_state.last_clipboard_text.is_none() {
                 return Ok(());
             }
 
             if suppress_empty {
                 debug!("suppressed local empty {selection} event caused by host RELEASE");
-                selection_state.last_wayland_text = None;
+                selection_state.last_clipboard_text = None;
                 return Ok(());
             }
 
-            info!("guest Wayland {selection} became empty");
+            info!("guest {selection} became empty");
             selection_state.owner = ClipboardOwner::Empty;
             selection_state.guest_cache = None;
-            selection_state.last_wayland_text = None;
+            selection_state.last_clipboard_text = None;
             let _ = transport.send_clipboard_release(selection)?;
         }
     }
@@ -608,8 +619,8 @@ mod recovery_tests {
         let mut state = BridgeState::default();
         state.clipboard.owner = ClipboardOwner::Guest;
         state.clipboard.guest_cache = Some("cached".into());
-        state.clipboard.last_wayland_text = Some("cached".into());
-        handle_wayland_read(
+        state.clipboard.last_clipboard_text = Some("cached".into());
+        handle_clipboard_read(
             &transport,
             &mut state,
             ClipboardSelection::Clipboard,
@@ -618,10 +629,13 @@ mod recovery_tests {
         .unwrap();
         assert_eq!(state.clipboard.owner, ClipboardOwner::Guest);
         assert_eq!(state.clipboard.guest_cache.as_deref(), Some("cached"));
-        assert_eq!(state.clipboard.last_wayland_text.as_deref(), Some("cached"));
+        assert_eq!(
+            state.clipboard.last_clipboard_text.as_deref(),
+            Some("cached")
+        );
         assert!(state.clipboard.read_pending);
         assert!(state.clipboard.retry_since.is_some());
-        handle_wayland_read(
+        handle_clipboard_read(
             &transport,
             &mut state,
             ClipboardSelection::Clipboard,
@@ -639,9 +653,9 @@ mod recovery_tests {
         let mut state = BridgeState::default();
         state.primary.owner = ClipboardOwner::Host;
         state.primary.host_cache = Some("host text".into());
-        state.primary.last_wayland_text = Some("host text".into());
+        state.primary.last_clipboard_text = Some("host text".into());
         state.primary.suppress_text = Some("host text".into());
-        handle_wayland_read(
+        handle_clipboard_read(
             &transport,
             &mut state,
             ClipboardSelection::Primary,
@@ -665,7 +679,7 @@ mod recovery_tests {
         };
         state.clipboard.owner = ClipboardOwner::Host;
         state.clipboard.host_cache = Some("visible text".into());
-        state.clipboard.last_wayland_text = Some("visible text".into());
+        state.clipboard.last_clipboard_text = Some("visible text".into());
         state.clipboard.suppress_text = Some("visible text".into());
         state.primary.suppress_empty = true;
         state.client_disconnected();
@@ -673,7 +687,7 @@ mod recovery_tests {
         assert_eq!(state.clipboard.owner, ClipboardOwner::Guest);
         assert_eq!(state.clipboard.guest_cache.as_deref(), Some("visible text"));
         assert_eq!(
-            state.clipboard.last_wayland_text.as_deref(),
+            state.clipboard.last_clipboard_text.as_deref(),
             Some("visible text")
         );
         assert!(state.clipboard.host_cache.is_none());
