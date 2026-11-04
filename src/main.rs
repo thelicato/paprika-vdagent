@@ -1,5 +1,6 @@
 mod file_transfer;
 mod selection;
+mod session;
 mod spice;
 mod wayland;
 mod wayland_watch;
@@ -10,7 +11,7 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use file_transfer::FileTransferManager;
 use selection::ClipboardSelection;
 use spice::{PeerCapabilities, SpiceTransport, TransportEvent, VD_AGENT_CLIPBOARD_UTF8_TEXT};
@@ -22,6 +23,9 @@ use wayland_watch::{WatchEvent, spawn_selection_watcher};
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<CliCommand>,
+
     #[arg(
         long,
         env = "PAPRIKA_VDAGENT_PORT",
@@ -47,6 +51,12 @@ struct Cli {
         default_value_t = 8
     )]
     max_active_file_transfers: usize,
+}
+
+#[derive(Debug, Subcommand)]
+enum CliCommand {
+    /// Import the current Wayland environment and restart the systemd user service
+    SessionStart,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,7 +114,10 @@ impl BridgeState {
 fn main() -> Result<()> {
     init_logging();
     let cli = Cli::parse();
-    run(cli)
+    match cli.command {
+        Some(CliCommand::SessionStart) => session::start(),
+        None => run(cli),
+    }
 }
 
 fn run(cli: Cli) -> Result<()> {

@@ -43,7 +43,11 @@ pkill -x spice-vdagent || true
 ```
 Standalone Wayland SPICE clipboard and file-transfer bridge for Linux guests
 
-Usage: paprika-vdagent [OPTIONS]
+Usage: paprika-vdagent [OPTIONS] [COMMAND]
+
+Commands:
+  session-start  Import the current Wayland environment and restart the systemd user service
+  help           Print help
 
 Options:
       --virtio-port <VIRTIO_PORT>
@@ -77,17 +81,11 @@ Install the package with your distro tools, or unpack the tarball and run `papri
 
 The packaged installs include a systemd user service at `/usr/lib/systemd/user/paprika-vdagent.service`. It is not enabled automatically.
 
-For persistent setup, follow **[Installation and session startup](docs/setup.md)**.
-The guide covers package installation on common distributions, disabling competing
-stock agents, persistent port permissions, Hyprland Lua and legacy configuration,
-Sway, other session managers, and troubleshooting.
+For persistent setup, follow **[Installation and session startup](docs/setup.md)**. The guide covers package installation on common distributions, disabling competing stock agents, persistent port permissions, Hyprland Lua and legacy configuration, Sway, other session managers, and troubleshooting.
 
-Start Paprika from your Wayland session after login so it receives the current
-compositor environment. Enabling the user service alone does not configure port
-permissions or guarantee that environment is available.
+Start Paprika from your Wayland session after login so it receives the current compositor environment. Enabling the user service alone does not configure port permissions or guarantee that environment is available.
 
-For pacman-based systems, the repo also includes a local package recipe in
-`packaging/pacman/`.
+For pacman-based systems, the repo also includes a local package recipe in `packaging/pacman/`.
 
 ## 🛠️ Build
 

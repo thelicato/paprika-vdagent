@@ -1,16 +1,12 @@
 # Installation and session startup
 
-Paprika runs **inside the guest's Wayland session**, after login. It needs both
-access to the SPICE virtio port and a compositor exposing `ext-data-control` or
-`wlr-data-control`. A distro's package format does not determine compositor
-compatibility. The steps below assume one desktop user per guest.
+Paprika runs **inside the guest's Wayland session**, after login. It needs both access to the SPICE virtio port and a compositor exposing `ext-data-control` or `wlr-data-control`. A distro's package format does not determine compositor compatibility. The steps below assume one desktop user per guest.
 
 ## 1. Install
 
 ### Distribution packages
 
-Download the release package for your architecture, then use your distro's tool
-(replace the example filename with the downloaded file):
+Download the release package for your architecture, then use your distro's tool (replace the example filename with the downloaded file):
 
 | Distribution | Command |
 | --- | --- |
@@ -23,8 +19,7 @@ Packages include the binary and a systemd user service. Continue with step 2.
 
 ### Build from source or use a tarball
 
-Build with a Rust toolchain supporting edition 2024 and your distro's Wayland
-development packages:
+Build with a Rust toolchain supporting edition 2024 and your distro's Wayland development packages:
 
 ```sh
 cargo build --locked --release
@@ -51,29 +46,20 @@ sudo install -Dm644 packaging/systemd/user/paprika-vdagent.service \
   /usr/lib/systemd/user/paprika-vdagent.service
 ```
 
-For tarballs, install the extracted binary at `/usr/bin/paprika-vdagent` and the
-[service file](../packaging/systemd/user/paprika-vdagent.service) at
-`/usr/lib/systemd/user/paprika-vdagent.service`, or run the binary directly using
-your compositor's autostart mechanism.
+Tarballs include this guide in `docs/` and the service in `packaging/systemd/user/`. For tarballs, install the extracted binary at `/usr/bin/paprika-vdagent` and the [service file](../packaging/systemd/user/paprika-vdagent.service) at `/usr/lib/systemd/user/paprika-vdagent.service`, or run the binary directly using your compositor's autostart mechanism.
 
 ## 2. Release the SPICE port
 
-Paprika owns `/dev/virtio-ports/com.redhat.spice.0` directly. The stock agents
-must not use it at the same time. On systemd systems:
+Paprika owns `/dev/virtio-ports/com.redhat.spice.0` directly. The stock agents must not use it at the same time. On systemd systems:
 
 ```sh
 sudo systemctl mask --now spice-vdagentd.service spice-vdagentd.socket
 pkill -x spice-vdagent || true
 ```
 
-If your distribution uses different unit names, inspect
-`systemctl list-unit-files 'spice*'` and stop/mask the corresponding daemon and
-socket. If no stock agent is installed, skip this step. Remove any explicit
-`spice-vdagent` launch from your session startup configuration as well.
+If your distribution uses different unit names, inspect `systemctl list-unit-files 'spice*'` and stop/mask the corresponding daemon and socket. If no stock agent is installed, skip this step. Remove any explicit `spice-vdagent` launch from your session startup configuration as well.
 
-Masking persists across reboots and prevents socket activation. Paprika replaces
-the stock clipboard and incoming file-transfer path; other stock-agent features
-are outside its scope.
+Masking persists across reboots and prevents socket activation. Paprika replaces the stock clipboard and incoming file-transfer path; other stock-agent features are outside its scope.
 
 ## 3. Persist port permissions
 
@@ -83,13 +69,9 @@ Check that the SPICE channel exists:
 ls -l /dev/virtio-ports/com.redhat.spice.0
 ```
 
-If absent, configure a SPICE guest-agent channel in the VM settings on the host.
-For libvirt/QEMU this is a virtio channel named `com.redhat.spice.0`. The QEMU
-guest-agent channel `org.qemu.guest_agent.0` serves a different purpose.
+If absent, configure a SPICE guest-agent channel in the VM settings on the host. For libvirt/QEMU this is a virtio channel named `com.redhat.spice.0`. The QEMU guest-agent channel `org.qemu.guest_agent.0` serves a different purpose.
 
-If your desktop user already has read/write access, no rule is needed. Otherwise,
-run the following **as the desktop user**, using sudo only as shown. This grants
-that user access to this specific port, including after reboot:
+If your desktop user already has read/write access, no rule is needed. Otherwise, run the following **as the desktop user**, using sudo only as shown. This grants that user access to this specific port, including after reboot:
 
 ```sh
 printf 'SUBSYSTEM=="virtio-ports", ATTR{name}=="com.redhat.spice.0", OWNER="%s", MODE="0600"\n' "$(id -un)" |
@@ -105,13 +87,9 @@ test -r /dev/virtio-ports/com.redhat.spice.0 &&
   test -w /dev/virtio-ports/com.redhat.spice.0 && echo 'Port access OK'
 ```
 
-See the [udev rule reference](https://www.freedesktop.org/software/systemd/man/latest/udev.html)
-for the matching and permission fields. This rule selects one user; multi-user guests need an administrator-managed group
-or active-session access policy instead. Running Paprika with sudo is unnecessary
-and can prevent it from connecting to your Wayland session.
+See the [udev rule reference](https://www.freedesktop.org/software/systemd/man/latest/udev.html) for the matching and permission fields. This rule selects one user; multi-user guests need an administrator-managed group or active-session access policy instead. Running Paprika with sudo is unnecessary and can prevent it from connecting to your Wayland session.
 
-For temporary testing only, the following grants access until the device is
-recreated. The `setfacl` command is provided by the `acl` package on Arch/CachyOS:
+For temporary testing only, the following grants access until the device is recreated. The `setfacl` command is provided by the `acl` package on Arch/CachyOS:
 
 ```sh
 sudo setfacl -m "u:$(id -un):rw" /dev/virtio-ports/com.redhat.spice.0
@@ -125,40 +103,36 @@ Run this once after installing or changing the service:
 systemctl --user daemon-reload
 ```
 
-Choose **one** startup method below. Importing the Wayland environment must
-happen at each login; doing it once in a terminal does not configure future
-sessions. Start the agent after login, rather than as a root system service.
+The installed binary provides `paprika-vdagent session-start`, which imports the current Wayland environment and restarts the systemd user service. It does not change permissions or stop competing agents.
+
+Choose **one** startup method below. Importing the Wayland environment must happen at each login; doing it once in a terminal does not configure future sessions. Start the agent after login, rather than as a root system service.
 
 ### Hyprland: Lua configuration
 
-Add this to `~/.config/hypr/hyprland.lua`, or put the `hl.exec_cmd` call inside an
-existing `hyprland.start` callback:
+Add this to `~/.config/hypr/hyprland.lua`, or put the `hl.exec_cmd` call inside an existing `hyprland.start` callback:
 
 ```lua
 hl.on("hyprland.start", function()
-    hl.exec_cmd("sh -c 'systemctl --user import-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR HYPRLAND_INSTANCE_SIGNATURE && systemctl --user restart paprika-vdagent.service'")
+    hl.exec_cmd("paprika-vdagent session-start")
 end)
 ```
 
-This uses Hyprland's [startup event](https://wiki.hypr.land/configuring/core/autostart/).
-It runs when Hyprland starts, rather than on configuration reload. Log out and
-back in to test it. This is the setup verified on CachyOS with Hyprland 0.56.2.
+This uses Hyprland's [startup event](https://wiki.hypr.land/configuring/core/autostart/). It runs when Hyprland starts, rather than on configuration reload. Log out and back in to test it. This is the setup verified on CachyOS with Hyprland 0.56.2.
 
 ### Hyprland: older hyprlang configuration
 
 For versions still using `~/.config/hypr/hyprland.conf`:
 
 ```ini
-exec-once = sh -c 'systemctl --user import-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR HYPRLAND_INSTANCE_SIGNATURE && systemctl --user restart paprika-vdagent.service'
+exec-once = paprika-vdagent session-start
 ```
 
 ### Sway
 
-Add this to `~/.config/sway/config` using Sway's
-[`exec` startup command](https://github.com/swaywm/sway/blob/master/sway/sway.5.scd):
+Add this to `~/.config/sway/config` using Sway's [`exec` startup command](https://github.com/swaywm/sway/blob/master/sway/sway.5.scd):
 
 ```text
-exec sh -c 'systemctl --user import-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR && systemctl --user restart paprika-vdagent.service'
+exec paprika-vdagent session-start
 ```
 
 ### Other compositors and session managers
@@ -166,37 +140,26 @@ exec sh -c 'systemctl --user import-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR 
 Use the compositor's login/autostart facility to run:
 
 ```sh
-sh -c 'systemctl --user import-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR && systemctl --user restart paprika-vdagent.service'
+paprika-vdagent session-start
 ```
 
-If the session manager already imports the Wayland environment and manages
-systemd graphical-session startup, use its documented service integration.
-The supplied unit is enabled under `default.target`; enabling it by itself does
-not guarantee the compositor environment is available. The explicit session
-hooks above do not require `systemctl --user enable`.
+If the session manager already imports the Wayland environment and manages systemd graphical-session startup, use its documented service integration. The supplied unit is enabled under `default.target`; enabling it by itself does not guarantee the compositor environment is available. The explicit session hooks above do not require `systemctl --user enable`.
 
-On systems without systemd, use your init system to prevent the stock agents
-from starting and run `paprika-vdagent` directly from the compositor's autostart
-facility after arranging port permissions.
+On systems without systemd, use your init system to prevent the stock agents from starting and run `paprika-vdagent` directly from the compositor's autostart facility after arranging port permissions.
 
-GNOME and KDE Plasma installations must also expose one of the required
-data-control protocols. Do not assume compatibility just because the session
-uses Wayland; a missing-protocol error cannot be fixed by enabling the service.
+GNOME and KDE Plasma installations must also expose one of the required data-control protocols. Do not assume compatibility just because the session uses Wayland; a missing-protocol error cannot be fixed by enabling the service.
 
 ## 5. Verify and troubleshoot
 
-Stop any manually launched Paprika process before starting the service, then run
-these inside your Wayland session to test immediately:
+Stop any manually launched Paprika process before starting the service, then run these inside your Wayland session to test immediately:
 
 ```sh
-systemctl --user import-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR
-systemctl --user restart paprika-vdagent.service
+paprika-vdagent session-start
 systemctl --user status paprika-vdagent.service
 journalctl --user -u paprika-vdagent.service -b --no-pager
 ```
 
-After reboot and login, check the status and logs again and test clipboard sync
-in both directions with your SPICE client connected.
+After reboot and login, check the status and logs again and test clipboard sync in both directions with your SPICE client connected.
 
 | Symptom | Check |
 | --- | --- |
@@ -215,8 +178,7 @@ For debug logs, use `systemctl --user edit paprika-vdagent.service`:
 Environment=RUST_LOG=paprika_vdagent=debug
 ```
 
-Then restart the service. Other settings can be supplied in the same override,
-for example `Environment=PAPRIKA_VDAGENT_FILE_DIR=/home/your-user/Downloads`.
+Then restart the service. Other settings can be supplied in the same override, for example `Environment=PAPRIKA_VDAGENT_FILE_DIR=/home/your-user/Downloads`.
 
 ## Returning to the stock agent
 
@@ -229,6 +191,4 @@ sudo udevadm control --reload-rules
 sudo systemctl unmask spice-vdagentd.service spice-vdagentd.socket
 ```
 
-Reboot to restore device permissions and your distro's normal session startup.
-If the stock daemon or socket was previously disabled, re-enable the appropriate
-unit according to your distro's setup.
+Reboot to restore device permissions and your distro's normal session startup. If the stock daemon or socket was previously disabled, re-enable the appropriate unit according to your distro's setup.

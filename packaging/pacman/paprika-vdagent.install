@@ -9,6 +9,9 @@ Paprika needs exclusive access to the SPICE virtio port and must start inside
   session startup (including Hyprland Lua and Sway). Enabling the user service
   alone is not sufficient on sessions without a current Wayland environment.
 
+  After completing setup, launch from your compositor's autostart with:
+    paprika-vdagent session-start
+
   View logs with:
     journalctl --user -u paprika-vdagent.service -b
 EOF

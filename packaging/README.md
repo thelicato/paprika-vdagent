@@ -7,6 +7,4 @@ Current layout:
 
 `.deb` and `.rpm` are generated from `Cargo.toml` metadata instead of separate handwritten spec trees. That keeps the package manifest close to the Rust crate metadata and avoids duplicating package version, description, and asset lists in multiple places.
 
-User installation and persistent startup instructions are in
-[docs/setup.md](../docs/setup.md). The pacman, Debian, and RPM packages install
-that guide as `/usr/share/doc/paprika-vdagent/setup.md`.
+User installation and persistent startup instructions are in [docs/setup.md](../docs/setup.md). The pacman, Debian, and RPM packages install that guide as `/usr/share/doc/paprika-vdagent/setup.md`.

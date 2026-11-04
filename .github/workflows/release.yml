@@ -94,8 +94,10 @@ jobs:
           install -m755 target/release/paprika-vdagent "$bundle_dir/paprika-vdagent"
           install -m644 README.md "$bundle_dir/README.md"
           install -m644 LICENSE "$bundle_dir/LICENSE"
+          install -Dm644 docs/setup.md "$bundle_dir/docs/setup.md"
+          install -Dm644 docs/architecture.md "$bundle_dir/docs/architecture.md"
           install -Dm644 packaging/systemd/user/paprika-vdagent.service \
-            "$bundle_dir/systemd/user/paprika-vdagent.service"
+            "$bundle_dir/packaging/systemd/user/paprika-vdagent.service"
 
           tar -C dist -czf "dist/$asset_name" "$(basename "$bundle_dir")"
           rm -rf "$bundle_dir"
