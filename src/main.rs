@@ -1,3 +1,4 @@
+mod doctor;
 mod file_transfer;
 mod selection;
 mod session;
@@ -55,6 +56,9 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum CliCommand {
+    /// Check session readiness without opening the SPICE port or reading the clipboard
+    Doctor,
+
     /// Import the current Wayland environment and restart the systemd user service
     SessionStart,
 }
@@ -116,6 +120,11 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Some(CliCommand::SessionStart) => session::start(),
+        Some(CliCommand::Doctor) => doctor::run(
+            &cli.virtio_port,
+            cli.seat.as_deref(),
+            cli.file_dir.as_deref(),
+        ),
         None => run(cli),
     }
 }

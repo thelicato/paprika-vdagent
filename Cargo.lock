@@ -297,6 +297,7 @@ version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
+ "rustix",
  "tracing",
  "tracing-subscriber",
  "wayland-client",

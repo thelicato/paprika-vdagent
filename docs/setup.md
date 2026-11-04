@@ -151,6 +151,20 @@ GNOME and KDE Plasma installations must also expose one of the required data-con
 
 ## 5. Verify and troubleshoot
 
+Run diagnostics from your Wayland session without sudo:
+
+```sh
+paprika-vdagent doctor
+```
+
+The command checks the compositor connection, advertised data-control protocols, requested seat, SPICE port permissions, competing stock agents, download directory, and systemd user service. It does not open the SPICE port, read or replace clipboard contents, create directories, or start/stop services. `[FAIL]` indicates a blocking problem and produces a non-zero exit status. `[WARN]` indicates an optional, incomplete, or unverified check, such as a missing service when you launch the binary directly. Successful diagnostics establish local prerequisites; test actual host/guest clipboard and file transfers separately.
+
+Place custom options before the subcommand, or use the same environment variables as the bridge:
+
+```sh
+paprika-vdagent --virtio-port /dev/virtio-ports/com.redhat.spice.0 --seat seat0 --file-dir "$HOME/Downloads" doctor
+```
+
 Stop any manually launched Paprika process before starting the service, then run these inside your Wayland session to test immediately:
 
 ```sh

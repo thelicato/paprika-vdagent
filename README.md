@@ -46,6 +46,7 @@ Standalone Wayland SPICE clipboard and file-transfer bridge for Linux guests
 Usage: paprika-vdagent [OPTIONS] [COMMAND]
 
 Commands:
+  doctor         Check session readiness without opening the SPICE port or reading the clipboard
   session-start  Import the current Wayland environment and restart the systemd user service
   help           Print help
 
@@ -86,6 +87,8 @@ For persistent setup, follow **[Installation and session startup](docs/setup.md)
 Start Paprika from your Wayland session after login so it receives the current compositor environment. Enabling the user service alone does not configure port permissions or guarantee that environment is available.
 
 For pacman-based systems, the repo also includes a local package recipe in `packaging/pacman/`.
+
+To check your setup without starting the bridge, run `paprika-vdagent doctor` from your Wayland session. It reports problems with actionable fixes and returns a non-zero exit status when required checks fail. See [diagnostics](docs/setup.md#5-verify-and-troubleshoot) for details.
 
 ## 🛠️ Build
 
