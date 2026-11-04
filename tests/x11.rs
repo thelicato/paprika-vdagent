@@ -198,6 +198,8 @@ fn doctor_checks_x11_without_requiring_wayland() {
     let output = fixture.doctor();
     assert!(output.contains("[OK] Connected to the X11 server"));
     assert!(output.contains("[OK] XFixes selection notifications"));
+    assert!(output.contains("[WARN] Ignoring the Wayland seat setting"));
+    assert!(!output.contains("[FAIL] --seat"));
     assert!(!output.contains("Wayland connection failed"));
 }
 
@@ -465,4 +467,30 @@ fn delayed_host_release_preserves_a_new_guest_owner() {
             .owner,
         NONE
     );
+}
+
+#[test]
+#[ignore = "requires Xvfb and xsel"]
+fn auto_detection_ignores_stale_wayland_variables_in_an_x11_session() {
+    let mut fixture = Fixture::with_stale_wayland();
+    fixture.wait_for_log("selected x11 clipboard backend");
+    fixture.negotiate();
+    fixture.guest_copy(Selection::Clipboard, b"native X11 selection");
+    fixture.expect_grab(Selection::Clipboard);
+    assert_eq!(
+        fixture.request_text(Selection::Clipboard),
+        b"native X11 selection"
+    );
+    fixture.host_copy(Selection::Clipboard, b"host X11 text");
+    fixture.quiet();
+}
+
+#[test]
+#[ignore = "requires Xvfb and xsel"]
+fn session_start_captures_the_private_x11_display_and_authentication() {
+    let fixture = Fixture::with_stale_wayland();
+    let config = fixture.session_start();
+    assert!(config.contains("Environment=\"PAPRIKA_VDAGENT_BACKEND=x11\""));
+    assert!(config.contains("UnsetEnvironment=WAYLAND_DISPLAY WAYLAND_SOCKET HYPRLAND_INSTANCE_SIGNATURE PAPRIKA_VDAGENT_SEAT"));
+    assert!(!config.contains("old-wayland"));
 }

@@ -67,14 +67,19 @@ pub fn run(
     file_dir: Option<&Path>,
 ) -> Result<()> {
     let mut report = Report::default();
-    match backend {
-        crate::Backend::Wayland => check_wayland(&mut report, seat),
-        crate::Backend::X11 => {
+    match backend.resolve() {
+        Err(error) => report.add(Level::Fail, format!("Backend selection failed: {error:#}")),
+        Ok(crate::DisplayBackend::Wayland) => check_wayland(&mut report, seat),
+        Ok(crate::DisplayBackend::X11) => {
             if seat.is_some() {
-                report.add(
-                    Level::Fail,
-                    "--seat applies only to Wayland; remove it when selecting the X11 backend.",
-                );
+                if matches!(backend, crate::Backend::Auto) {
+                    report.add(Level::Warn, "Ignoring the Wayland seat setting in an automatically detected X11 session.");
+                } else {
+                    report.add(
+                        Level::Fail,
+                        "--seat applies only to Wayland; remove it when selecting the X11 backend.",
+                    );
+                }
             }
             let (sender, receiver) = mpsc::sync_channel(1);
             thread::spawn(move || {

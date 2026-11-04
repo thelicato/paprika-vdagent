@@ -32,6 +32,19 @@ impl Fixture {
     }
 
     pub fn with_options(notifications: bool, limit: usize, timeout: u64) -> Self {
+        Self::with_environment(notifications, limit, timeout, false)
+    }
+
+    pub fn with_stale_wayland() -> Self {
+        Self::with_environment(true, 1024 * 1024, 2000, true)
+    }
+
+    fn with_environment(
+        notifications: bool,
+        limit: usize,
+        timeout: u64,
+        stale_wayland: bool,
+    ) -> Self {
         let directory = TestDir::new();
         fs::create_dir(directory.0.join("runtime")).unwrap();
         let mut cookie = [0; 16];
@@ -82,7 +95,7 @@ impl Fixture {
             .env("DISPLAY", &display)
             .env("XAUTHORITY", directory.0.join("authority"))
             .env("RUST_LOG", "paprika_vdagent=debug")
-            .args(["--backend", "x11", "--poll-ms", "20", "--max-text-bytes"])
+            .args(["--poll-ms", "20", "--max-text-bytes"])
             .arg(limit.to_string())
             .arg("--clipboard-timeout-ms")
             .arg(timeout.to_string())
@@ -92,6 +105,14 @@ impl Fixture {
             .arg(directory.0.join("Downloads"))
             .stdout(log.try_clone().unwrap())
             .stderr(log);
+        if stale_wayland {
+            command
+                .env("XDG_SESSION_TYPE", "x11")
+                .env("WAYLAND_DISPLAY", "old-wayland")
+                .env("WAYLAND_SOCKET", "42")
+                .env("HYPRLAND_INSTANCE_SIGNATURE", "old-hyprland")
+                .env("PAPRIKA_VDAGENT_SEAT", "old-wayland-seat");
+        }
         if !notifications {
             command.arg("--poll-only");
         }
@@ -213,6 +234,30 @@ impl Fixture {
         }
     }
 
+    pub fn session_start(&self) -> String {
+        let mut command = session_start_command(&self.directory.0);
+        command
+            .env("XDG_SESSION_TYPE", "x11")
+            .env("DISPLAY", &self.display)
+            .env("XAUTHORITY", self.directory.0.join("authority"))
+            .env("WAYLAND_DISPLAY", "old-wayland")
+            .env("WAYLAND_SOCKET", "42");
+        let (status, _) = self.capture(&mut command);
+        assert!(status.success());
+        let config = fs::read_to_string(
+            self.directory
+                .0
+                .join("runtime/systemd/user/paprika-vdagent.service.d/90-paprika-session.conf"),
+        )
+        .unwrap();
+        assert!(config.contains(&format!("Environment=\"DISPLAY={}\"", self.display)));
+        assert!(config.contains(&format!(
+            "Environment=\"XAUTHORITY={}\"",
+            self.directory.0.join("authority").display()
+        )));
+        config
+    }
+
     pub fn doctor(&self) -> String {
         let bin = self.directory.0.join("bin");
         fs::create_dir(&bin).unwrap();
@@ -222,7 +267,10 @@ impl Fixture {
         let (_, output) = self.capture(
             self.command(env!("CARGO_BIN_EXE_paprika-vdagent"))
                 .env("PATH", bin)
-                .args(["--backend", "x11", "--virtio-port"])
+                .env("XDG_SESSION_TYPE", "x11")
+                .env("WAYLAND_DISPLAY", "old-wayland")
+                .env("PAPRIKA_VDAGENT_SEAT", "old-wayland-seat")
+                .arg("--virtio-port")
                 .arg(&self.host.path)
                 .arg("doctor"),
         );

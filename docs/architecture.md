@@ -73,7 +73,13 @@ Technically, a custom Wayland agent could talk to `/run/spice-vdagentd/spice-vda
 
 The SPICE bridge uses the `Clipboard` interface for reading, writing, clearing, selection capabilities, and starting a change watcher. Backends report `ClipboardEvent` notifications and return `ClipboardRead::Ready` for completed reads or `ClipboardRead::Retry` when the cached selection should be retained. The bridge owns clipboard caches, echo suppression, retry scheduling, SPICE negotiation, and file transfers independently of the display connection.
 
-`WaylandClipboard` and `X11Clipboard` implement this interface. Wayland remains the default and X11 is selected explicitly with `--backend x11`. The Wayland backend keeps the existing data-control protocols, selection support, payload deadline, and watcher fallback. Adding another backend does not require changing the clipboard ownership flow or SPICE transport.
+`WaylandClipboard` and `X11Clipboard` implement this interface. The default `auto` backend selects the native graphical session, with explicit `wayland` and `x11` overrides. The Wayland backend keeps the existing data-control protocols, selection support, payload deadline, and watcher fallback. Adding another backend does not require changing the clipboard ownership flow or SPICE transport.
+
+## Backend detection and session startup
+
+The bridge, diagnostics, and startup helper share one backend resolver. Explicit configuration wins over session hints. Automatic detection uses `XDG_SESSION_TYPE` first, then prefers Wayland display hints over `DISPLAY`. This protects native Wayland sessions from being mistaken for X11 when XWayland is available, while an explicit X11 session type overrides stale Wayland variables. Detection does not retry another backend after a connection or protocol failure.
+
+`session-start` validates the selected display and runtime directory before writing a private runtime drop-in for the user service. It supplies service-specific display and authentication settings through `Environment=` and removes stale settings through `UnsetEnvironment=`. It does not import or unset variables in the user manager's global environment. Systemd quoting and specifier escaping preserve literal values; relative X11 authentication paths are made absolute. Replacing the drop-in, reloading the manager, and restarting the service applies each new session to the same service without changing the clipboard backend implementations.
 
 ## Wayland backend
 

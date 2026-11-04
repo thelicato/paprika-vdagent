@@ -26,10 +26,15 @@ pub struct Fixture {
     socket: PathBuf,
     // Declared last so processes and file descriptors are dropped first.
     directory: TestDir,
+    xwayland_hint: bool,
 }
 
 impl Fixture {
     pub fn new() -> Self {
+        Self::with_xwayland_hint(false)
+    }
+
+    pub fn with_xwayland_hint(xwayland_hint: bool) -> Self {
         let directory = TestDir::new();
         let runtime = directory.0.join("runtime");
         fs::create_dir(&runtime).unwrap();
@@ -79,7 +84,7 @@ impl Fixture {
             thread::sleep(Duration::from_millis(10));
         };
         let host = Host::new();
-        let bridge = Self::spawn_bridge(&directory.0, &socket, &host.path);
+        let bridge = Self::spawn_bridge(&directory.0, &socket, &host.path, xwayland_hint);
         let mut fixture = Self {
             host,
             bridge,
@@ -87,6 +92,7 @@ impl Fixture {
             clients: Vec::new(),
             socket,
             directory,
+            xwayland_hint,
         };
         fixture.wait_for_log("starting bridge loop");
         let payload = fixture.expect(CAPABILITIES);
@@ -98,20 +104,26 @@ impl Fixture {
         fixture
     }
 
-    fn spawn_bridge(directory: &Path, socket: &Path, port: &Path) -> Process {
+    fn spawn_bridge(directory: &Path, socket: &Path, port: &Path, xwayland_hint: bool) -> Process {
         let log = File::create(directory.join("bridge.log")).unwrap();
-        Process::spawn(
-            isolated_command(directory, env!("CARGO_BIN_EXE_paprika-vdagent"))
-                .env("WAYLAND_DISPLAY", socket)
-                .env("RUST_LOG", "paprika_vdagent=debug")
-                .arg("--virtio-port")
-                .arg(port)
-                .args(["--poll-ms", "20", "--clipboard-timeout-ms", "100"])
-                .arg("--file-dir")
-                .arg(directory.join("Downloads"))
-                .stdout(log.try_clone().unwrap())
-                .stderr(log),
-        )
+        let mut command = isolated_command(directory, env!("CARGO_BIN_EXE_paprika-vdagent"));
+        command
+            .env("WAYLAND_DISPLAY", socket)
+            .env("RUST_LOG", "paprika_vdagent=debug")
+            .arg("--virtio-port")
+            .arg(port)
+            .args(["--poll-ms", "20", "--clipboard-timeout-ms", "100"])
+            .arg("--file-dir")
+            .arg(directory.join("Downloads"))
+            .stdout(log.try_clone().unwrap())
+            .stderr(log);
+        if xwayland_hint {
+            command
+                .env("XDG_SESSION_TYPE", "wayland")
+                .env("DISPLAY", ":789")
+                .env("XAUTHORITY", directory.join("unused-xwayland-authority"));
+        }
+        Process::spawn(&mut command)
     }
 
     fn command(&self, program: impl AsRef<std::ffi::OsStr>) -> Command {
@@ -318,13 +330,40 @@ impl Fixture {
         }
     }
 
+    pub fn session_start(&self) -> String {
+        let mut command = session_start_command(&self.directory.0);
+        command
+            .env("XDG_SESSION_TYPE", "wayland")
+            .env("WAYLAND_DISPLAY", &self.socket)
+            .env("DISPLAY", ":789")
+            .env("XAUTHORITY", "/old-x11-authority");
+        let (status, _) = self.capture(&mut command);
+        assert!(status.success());
+        let config = fs::read_to_string(
+            self.directory
+                .0
+                .join("runtime/systemd/user/paprika-vdagent.service.d/90-paprika-session.conf"),
+        )
+        .unwrap();
+        assert!(config.contains(&format!(
+            "Environment=\"WAYLAND_DISPLAY={}\"",
+            self.socket.display()
+        )));
+        config
+    }
+
     pub fn restart_bridge(&mut self) {
         assert!(
             self.bridge.0.try_wait().unwrap().is_some(),
             "previous bridge must have exited"
         );
         self.host = Host::new();
-        self.bridge = Self::spawn_bridge(&self.directory.0, &self.socket, &self.host.path);
+        self.bridge = Self::spawn_bridge(
+            &self.directory.0,
+            &self.socket,
+            &self.host.path,
+            self.xwayland_hint,
+        );
         self.wait_for_log("starting bridge loop");
         self.expect(CAPABILITIES);
     }

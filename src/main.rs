@@ -1,3 +1,4 @@
+mod backend;
 mod clipboard;
 mod clipboard_io;
 #[cfg(test)]
@@ -17,7 +18,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand, ValueEnum};
+use backend::{Backend, DisplayBackend};
+use clap::{Parser, Subcommand};
 use clipboard::{Clipboard, ClipboardEvent, ClipboardRead};
 use file_transfer::FileTransferManager;
 use selection::ClipboardSelection;
@@ -33,7 +35,7 @@ struct Cli {
     command: Option<CliCommand>,
 
     /// Session clipboard backend
-    #[arg(long, env = "PAPRIKA_VDAGENT_BACKEND", value_enum, default_value_t = Backend::Wayland)]
+    #[arg(long, env = "PAPRIKA_VDAGENT_BACKEND", value_enum, default_value_t = Backend::Auto)]
     backend: Backend,
 
     #[arg(
@@ -71,18 +73,12 @@ struct Cli {
     max_active_file_transfers: usize,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum Backend {
-    Wayland,
-    X11,
-}
-
 #[derive(Debug, Subcommand)]
 enum CliCommand {
     /// Check session readiness without opening the SPICE port or reading the clipboard
     Doctor,
 
-    /// Import the current Wayland environment and restart the systemd user service
+    /// Configure this graphical session and restart the systemd user service
     SessionStart,
 }
 
@@ -162,12 +158,7 @@ fn main() -> Result<()> {
     init_logging();
     let cli = Cli::parse();
     match cli.command {
-        Some(CliCommand::SessionStart) => match cli.backend {
-            Backend::Wayland => session::start(),
-            Backend::X11 => bail!(
-                "for X11, start `paprika-vdagent --backend x11` from your session; session-start currently requires Wayland"
-            ),
-        },
+        Some(CliCommand::SessionStart) => session::start(cli.backend),
         Some(CliCommand::Doctor) => doctor::run(
             cli.backend,
             &cli.virtio_port,
@@ -180,8 +171,10 @@ fn main() -> Result<()> {
 
 fn run(cli: Cli) -> Result<()> {
     let timeout = Duration::from_millis(cli.clipboard_timeout_ms);
-    let clipboard: Box<dyn Clipboard> = match cli.backend {
-        Backend::Wayland => {
+    let backend = cli.backend.resolve()?;
+    info!("selected {} clipboard backend", backend.as_str());
+    let clipboard: Box<dyn Clipboard> = match backend {
+        DisplayBackend::Wayland => {
             let seat = cli
                 .seat
                 .as_ref()
@@ -189,9 +182,17 @@ fn run(cli: Cli) -> Result<()> {
                 .unwrap_or(SeatSelector::Unspecified);
             Box::new(WaylandClipboard::new(cli.max_text_bytes, seat, timeout)?)
         }
-        Backend::X11 => {
+        DisplayBackend::X11 => {
             if cli.seat.is_some() {
-                bail!("--seat applies only to Wayland; remove it when selecting the X11 backend");
+                if matches!(cli.backend, Backend::Auto) {
+                    warn!(
+                        "ignoring the Wayland seat setting in an automatically detected X11 session"
+                    );
+                } else {
+                    bail!(
+                        "--seat applies only to Wayland; remove it when selecting the X11 backend"
+                    );
+                }
             }
             Box::new(x11::X11Clipboard::new(cli.max_text_bytes, timeout)?)
         }

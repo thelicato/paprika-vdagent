@@ -2,7 +2,7 @@
 
 `paprika-vdagent` is a standalone X11 and Wayland clipboard and file-transfer bridge for SPICE/QEMU Linux guests.
 
-It supports native Wayland clipboard access on Hyprland and other compatible compositors, plus native X11 sessions. Wayland is the default backend; select `--backend x11` in an X11 session.
+It supports native Wayland clipboard access on Hyprland and other compatible compositors, plus native X11 sessions. The default `--backend auto` selects the native session. You can force `--backend wayland` or `--backend x11` when needed.
 
 ## ✨ What It Does
 
@@ -48,12 +48,12 @@ Usage: paprika-vdagent [OPTIONS] [COMMAND]
 
 Commands:
   doctor         Check session readiness without opening the SPICE port or reading the clipboard
-  session-start  Import the current Wayland environment and restart the systemd user service
+  session-start  Configure this graphical session and restart the systemd user service
   help           Print this message or the help of the given subcommand(s)
 
 Options:
       --backend <BACKEND>
-          Session clipboard backend [env: PAPRIKA_VDAGENT_BACKEND=] [default: wayland] [possible values: wayland, x11]
+          Session clipboard backend [env: PAPRIKA_VDAGENT_BACKEND=] [default: auto] [possible values: auto, wayland, x11]
       --virtio-port <VIRTIO_PORT>
           [env: PAPRIKA_VDAGENT_PORT=] [default: /dev/virtio-ports/com.redhat.spice.0]
       --poll-ms <POLL_MS>
@@ -95,7 +95,7 @@ Start Paprika from your graphical session after login so it receives the current
 
 For pacman-based systems, the repo also includes a local package recipe in `packaging/pacman/`.
 
-To check your setup without starting the bridge, run `paprika-vdagent doctor` for Wayland or `paprika-vdagent --backend x11 doctor` for X11. It reports problems with actionable fixes and returns a non-zero exit status when required checks fail. See [diagnostics](docs/setup.md#5-verify-and-troubleshoot) for details.
+To check your setup without starting the bridge, run `paprika-vdagent doctor` from your graphical session. It uses the same automatic backend selection as the bridge. It reports problems with actionable fixes and returns a non-zero exit status when required checks fail. See [diagnostics](docs/setup.md#5-verify-and-troubleshoot) for details.
 
 ## 🛠️ Build
 
@@ -111,19 +111,19 @@ The binary will be at:
 target/release/paprika-vdagent
 ```
 
-Run it from the guest Wayland session:
+Run it from the guest graphical session:
 
 ```bash
 RUST_LOG=paprika_vdagent=debug ./target/release/paprika-vdagent
 ```
 
-For a native X11 session:
+To explicitly select X11:
 
 ```bash
 RUST_LOG=paprika_vdagent=debug ./target/release/paprika-vdagent --backend x11
 ```
 
-The X11 backend uses `DISPLAY` and the usual X authentication settings, including `XAUTHORITY`. It does not require `xsel` or `xclip` at runtime. The `session-start` helper configures Wayland startup; use the [X11 startup instructions](docs/setup.md#native-x11-sessions) for X11.
+The X11 backend uses `DISPLAY` and the usual X authentication settings, including `XAUTHORITY`. It does not require `xsel` or `xclip` at runtime. The same `paprika-vdagent session-start` helper configures startup for both X11 and Wayland; see [session startup](docs/setup.md#4-start-with-your-graphical-session).
 
 If you want incoming files somewhere else:
 

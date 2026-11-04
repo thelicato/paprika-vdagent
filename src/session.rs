@@ -1,39 +1,179 @@
+use std::ffi::OsString;
+use std::fs::{self, DirBuilder, OpenOptions};
+use std::io::Write;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result, bail};
 
-/// Import only variables belonging to this session, then restart the user unit.
-pub fn start() -> Result<()> {
-    for name in ["WAYLAND_DISPLAY", "XDG_RUNTIME_DIR"] {
-        if std::env::var_os(name).is_none_or(|value| value.is_empty()) {
-            bail!(
-                "{name} is not set; run `paprika-vdagent session-start` inside your Wayland session"
-            );
-        }
-    }
+use crate::backend::{Backend, DisplayBackend};
 
-    let mut variables = vec!["WAYLAND_DISPLAY", "XDG_RUNTIME_DIR"];
-    if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some_and(|value| !value.is_empty()) {
-        variables.push("HYPRLAND_INSTANCE_SIGNATURE");
-    }
-    let status = Command::new("systemctl")
-        .args(["--user", "import-environment"])
-        .args(variables)
-        .status()
-        .context("could not run systemctl; without systemd, launch paprika-vdagent directly from your compositor")?;
-    if !status.success() {
-        bail!("could not import the Wayland environment into the systemd user manager ({status})");
-    }
+const UNIT: &str = "paprika-vdagent.service";
+const DROP_IN: &str = "systemd/user/paprika-vdagent.service.d/90-paprika-session.conf";
 
-    let status = Command::new("systemctl")
-        .args(["--user", "restart", "paprika-vdagent.service"])
-        .status()
-        .context("could not restart the Paprika user service")?;
-    if !status.success() {
+/// Scope the session environment to this service, then reload and restart it.
+pub fn start(requested: Backend) -> Result<()> {
+    let backend = requested.resolve()?;
+    let runtime = PathBuf::from(required("XDG_RUNTIME_DIR")?);
+    if !runtime.is_absolute() || !runtime.is_dir() {
         bail!(
-            "could not restart paprika-vdagent.service ({status}); install the user service and run `systemctl --user daemon-reload`"
+            "XDG_RUNTIME_DIR must name an existing absolute directory; run session-start inside your graphical session"
         );
     }
-    println!("Started paprika-vdagent.service with this Wayland session's environment.");
+    let mut environment = vec![
+        ("PAPRIKA_VDAGENT_BACKEND", OsString::from(backend.as_str())),
+        ("XDG_SESSION_TYPE", OsString::from(backend.as_str())),
+        ("XDG_RUNTIME_DIR", runtime.as_os_str().to_owned()),
+    ];
+    match backend {
+        DisplayBackend::Wayland => {
+            environment.push((
+                "WAYLAND_DISPLAY",
+                required("WAYLAND_DISPLAY").context(
+                    "a WAYLAND_SOCKET file descriptor cannot be forwarded to a systemd service",
+                )?,
+            ));
+            if let Some(signature) = present("HYPRLAND_INSTANCE_SIGNATURE") {
+                environment.push(("HYPRLAND_INSTANCE_SIGNATURE", signature));
+            }
+        }
+        DisplayBackend::X11 => {
+            environment.push(("DISPLAY", required("DISPLAY")?));
+            if let Some(authority) = present("XAUTHORITY") {
+                let authority = PathBuf::from(authority);
+                let authority = if authority.is_absolute() {
+                    authority
+                } else {
+                    std::env::current_dir()
+                        .context("could not resolve the relative XAUTHORITY path")?
+                        .join(authority)
+                };
+                environment.push(("XAUTHORITY", authority.into_os_string()));
+            }
+        }
+    }
+    let mut unset = vec![
+        "WAYLAND_DISPLAY",
+        "WAYLAND_SOCKET",
+        "DISPLAY",
+        "XAUTHORITY",
+        "HYPRLAND_INSTANCE_SIGNATURE",
+    ];
+    unset.retain(|name| !environment.iter().any(|(key, _)| key == name));
+    if backend == DisplayBackend::X11 {
+        unset.push("PAPRIKA_VDAGENT_SEAT");
+    }
+    let config = render(&environment, &unset)?;
+    write_override(&runtime.join(DROP_IN), config.as_bytes())?;
+
+    systemctl(
+        &["--user", "daemon-reload"],
+        "could not reload the systemd user manager",
+    )?;
+    systemctl(
+        &["--user", "restart", UNIT],
+        "could not restart paprika-vdagent.service; install the user service and check its logs",
+    )?;
+    println!(
+        "Started {UNIT} with this {} session's environment.",
+        backend.as_str()
+    );
     Ok(())
+}
+
+fn present(name: &str) -> Option<OsString> {
+    std::env::var_os(name).filter(|value| !value.is_empty())
+}
+
+fn required(name: &str) -> Result<OsString> {
+    present(name).with_context(|| {
+        format!(
+            "{name} is not set; run `paprika-vdagent session-start` inside your graphical session"
+        )
+    })
+}
+
+fn render(environment: &[(&str, OsString)], unset: &[&str]) -> Result<String> {
+    let mut config = String::from("# Generated by paprika-vdagent session-start.\n[Service]\n");
+    for (name, value) in environment {
+        let value = value.to_str().with_context(|| {
+            format!("{name} is not valid UTF-8 and cannot be passed through a systemd unit")
+        })?;
+        config.push_str(&format!("Environment=\"{name}={}\"\n", escape(value)));
+    }
+    config.push_str(&format!("UnsetEnvironment={}\n", unset.join(" ")));
+    Ok(config)
+}
+
+fn escape(value: &str) -> String {
+    let mut escaped = String::new();
+    for character in value.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '%' => escaped.push_str("%%"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            ch if ch.is_control() => {
+                escaped.push_str(&format!("\\u{:04x}", u32::from(ch)));
+            }
+            ch => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn write_override(path: &Path, config: &[u8]) -> Result<()> {
+    static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+    let parent = path
+        .parent()
+        .context("session override has no parent directory")?;
+    DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(parent)
+        .context("could not create the runtime user-service directory")?;
+    let temporary = parent.join(format!(
+        ".session-{}-{}.tmp",
+        std::process::id(),
+        NEXT_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        file.write_all(config)?;
+        fs::rename(&temporary, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result.with_context(|| format!("could not save session settings to {}", path.display()))
+}
+
+fn systemctl(arguments: &[&str], failure: &str) -> Result<()> {
+    let status = Command::new("systemctl").args(arguments).status()
+        .context("could not run systemctl; without systemd, launch paprika-vdagent directly from your session")?;
+    if !status.success() {
+        bail!("{failure} ({status})");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unit_values_escape_specifiers_quotes_and_control_characters() {
+        assert_eq!(escape("a%b\"c\\d\ne\tf\rg"), "a%%b\\\"c\\\\d\\ne\\tf\\rg");
+        assert_eq!(escape("$HOME/file name"), "$HOME/file name");
+        assert_eq!(escape("\u{85}\u{1b}"), "\\u0085\\u001b");
+    }
 }

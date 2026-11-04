@@ -74,7 +74,7 @@ Run the native X11 scenarios explicitly:
 cargo test --locked --test x11 -- --ignored
 ```
 
-Each fixture starts an authenticated Xvfb server with an automatically allocated display number and TCP disabled. Clients use a private authority file containing a random cookie. The real Paprika binary runs with `--backend x11`, a raw pseudoterminal for SPICE, and a private download directory. Tests use `xsel` and independent X11 protocol clients for clipboard requests; no live display or authentication environment is inherited. The `doctor` scenario substitutes a private systemctl stub and checks the fixture's port.
+Each fixture starts an authenticated Xvfb server with an automatically allocated display number and TCP disabled. Clients use a private authority file containing a random cookie. The real Paprika binary uses automatic X11 selection, a raw pseudoterminal for SPICE, and a private download directory. Tests use `xsel` and independent X11 protocol clients for clipboard requests; no live display or authentication environment is inherited. The `doctor` scenario substitutes a private systemctl stub and checks the fixture's port.
 
 The suite covers both selections, UTF-8 and Latin-1 text, large incremental transfers in both directions, ownership changes, echo suppression, `TARGETS`, `TIMESTAMP`, `MULTIPLE`, explicit polling, SPICE client reconnection, selection and INCR timeouts, oversized data, vanished requestors, and cleanup after X11 or transport failure. The polling scenario uses `--poll-only` and leaves XFixes enabled in Xvfb; it exercises explicit polling independently of extension availability.
 
@@ -83,3 +83,9 @@ Set `PAPRIKA_TEST_XVFB` to use an Xvfb executable or wrapper outside `PATH`. The
 ```sh
 PAPRIKA_TEST_XVFB=/path/to/Xvfb cargo test --locked --test x11 -- --ignored
 ```
+
+## Automatic selection and session startup
+
+Standard tests cover the resolver's precedence rules, explicit overrides, empty or missing hints, XWayland display hints, and stale Wayland variables in an X11 session. Startup tests replace systemctl with a private stub, inspect the generated runtime drop-in, and exercise repeated session switches, authentication fallback, relative paths, quoting, permissions, and reload/start failures.
+
+The Wayland integration suite runs with automatic selection, including a session with XWayland display hints. The X11 suite runs without an explicit backend and includes stale Wayland variables and a Wayland seat setting. Both suites invoke `session-start` with their real private display settings and a systemctl stub, verifying that it records the correct display and authentication settings without touching the live user manager. The runtime drop-in's systemd syntax is also checked offline during development.

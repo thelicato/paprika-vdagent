@@ -1,6 +1,6 @@
 # Installation and session startup
 
-Paprika runs **inside the guest's graphical session**, after login. It needs access to the SPICE virtio port and either a Wayland compositor exposing `ext-data-control` or `wlr-data-control`, or an X11 server. Wayland is the default backend; native X11 sessions use `--backend x11`. A distro's package format does not determine display compatibility. The steps below assume one desktop user per guest.
+Paprika runs **inside the guest's graphical session**, after login. It needs access to the SPICE virtio port and either a Wayland compositor exposing `ext-data-control` or `wlr-data-control`, or an X11 server. The default `--backend auto` selects the native session; `--backend wayland` and `--backend x11` provide explicit overrides. A distro's package format does not determine display compatibility. The steps below assume one desktop user per guest.
 
 ## 1. Install
 
@@ -97,41 +97,45 @@ sudo setfacl -m "u:$(id -un):rw" /dev/virtio-ports/com.redhat.spice.0
 
 ## 4. Start with your graphical session
 
-Run this once after installing or changing the service:
+The installed binary provides `paprika-vdagent session-start` for both X11 and Wayland. It detects the session, saves settings in a private runtime override for `paprika-vdagent.service`, reloads the user manager, and restarts the service. It does not change permissions, stop competing agents, or change other user services' environments.
 
-```sh
-systemctl --user daemon-reload
-```
+Choose **one** startup method below and run it at each graphical login. The existing Hyprland and Sway commands remain the same. You do not need to enable the user service separately when using these hooks.
 
-The installed binary provides `paprika-vdagent session-start`, which imports the current Wayland environment and restarts the systemd user service. It does not change permissions or stop competing agents.
+### Automatic backend selection
 
-Choose **one** startup method below. Importing the Wayland environment must happen at each login; doing it once in a terminal does not configure future sessions. Start the agent after login, rather than as a root system service.
+`paprika-vdagent`, `paprika-vdagent doctor`, and `paprika-vdagent session-start` use the same rules:
 
-### Native X11 sessions
+1. An explicit `--backend wayland` or `--backend x11`, including `PAPRIKA_VDAGENT_BACKEND`, overrides detection.
+2. `XDG_SESSION_TYPE=wayland` selects Wayland, and `XDG_SESSION_TYPE=x11` selects X11, even if variables from an older session remain.
+3. Without a recognised session type, a non-empty `WAYLAND_DISPLAY` or `WAYLAND_SOCKET` selects Wayland. Otherwise a non-empty `DISPLAY` selects X11.
+4. Without a display hint, detection fails with instructions to run inside a graphical session or select a backend explicitly.
 
-Run the installed binary from your X11 session:
+A Wayland session keeps using native data-control access when XWayland also sets `DISPLAY`. A failed Wayland connection or missing data-control protocol does not trigger an X11 fallback. When session metadata is missing or misleading, use an explicit backend override.
+
+For example, force X11 for a manual run or service startup with:
 
 ```sh
 paprika-vdagent --backend x11
+paprika-vdagent --backend x11 session-start
 ```
 
-The backend uses `DISPLAY` and the session's X authentication settings, including `XAUTHORITY` when set. It supports regular clipboard and primary selection, UTF-8 text, Latin-1 `STRING` conversion, and incremental transfers for large selections. XFixes supplies change notifications when available; otherwise the bridge polls using `--poll-ms`. Use `--poll-only` to force polling when troubleshooting unreliable notifications. `--seat` is specific to Wayland and must be omitted for X11.
+The startup helper requires an existing absolute `XDG_RUNTIME_DIR` and the selected display variable. A `WAYLAND_SOCKET` file descriptor alone cannot be forwarded to the service, so Wayland service startup requires `WAYLAND_DISPLAY`.
 
-The Wayland `session-start` helper is not used for X11. Add `paprika-vdagent --backend x11` to your X11 desktop or window manager's autostart configuration. For desktops supporting XDG autostart, create `~/.config/autostart/paprika-vdagent.desktop` with:
+### X11 and desktops supporting XDG autostart
+
+Add `paprika-vdagent session-start` to your desktop or window manager's autostart configuration. For desktops supporting XDG autostart, create `~/.config/autostart/paprika-vdagent.desktop` with:
 
 ```ini
 [Desktop Entry]
 Type=Application
 Name=Paprika SPICE clipboard bridge
-Exec=/usr/bin/paprika-vdagent --backend x11
+Exec=/usr/bin/paprika-vdagent session-start
 Terminal=false
 ```
 
-Use one Paprika launch method per session. Stop the Paprika user service before using direct X11 autostart, and disable its automatic startup if enabled. The stock SPICE agents must remain stopped and the port permissions from steps 2 and 3 still apply. This desktop entry is for X11 sessions; remove it before switching to a Wayland autostart method.
+This entry can be used across X11 and Wayland sessions when the desktop supports XDG autostart. Replace an older X11-only entry that starts the bridge directly with `--backend x11`; use one launch method per session. The stock SPICE agents must remain stopped and the port permissions from steps 2 and 3 still apply.
 
-### Wayland sessions
-
-The remaining startup examples use the default Wayland backend and its `session-start` helper.
+The X11 backend uses `DISPLAY` and the session's X authentication settings, including `XAUTHORITY` when set. It supports regular clipboard and primary selection, UTF-8 text, Latin-1 `STRING` conversion, and incremental transfers for large selections. XFixes supplies change notifications when available; otherwise the bridge polls using `--poll-ms`. Use `--poll-only` to force polling when troubleshooting unreliable notifications. A Wayland seat setting is ignored during automatic X11 selection; omit `--seat` when forcing the X11 backend.
 
 ### Hyprland: Lua configuration
 
@@ -169,19 +173,33 @@ Use the compositor's login/autostart facility to run:
 paprika-vdagent session-start
 ```
 
-If the session manager already imports the Wayland environment and manages systemd graphical-session startup, use its documented service integration. The supplied unit is enabled under `default.target`; enabling it by itself does not guarantee the compositor environment is available. The explicit session hooks above do not require `systemctl --user enable`.
+If the session manager already supplies the correct display environment and manages systemd graphical-session startup, use its documented service integration. The supplied unit is enabled under `default.target`; enabling it by itself does not guarantee that a display is ready. With the hooks above, `session-start` supplies the service settings at login.
 
-On systems without systemd, use your init system to prevent the stock agents from starting and run `paprika-vdagent` directly from the compositor's autostart facility after arranging port permissions.
+On systems without systemd, use your init system to prevent the stock agents from starting and run `paprika-vdagent` directly from the graphical session's autostart facility after arranging port permissions. Backend detection is the same; `session-start` requires systemd.
 
 GNOME and KDE Plasma installations must also expose one of the required data-control protocols. Do not assume compatibility just because the session uses Wayland; a missing-protocol error cannot be fixed by enabling the service.
 
+### Session settings and switching desktops
+
+`session-start` atomically replaces `$XDG_RUNTIME_DIR/systemd/user/paprika-vdagent.service.d/90-paprika-session.conf`, with permissions `0600`. The override selects the resolved backend and display for Paprika only. It is runtime configuration, so it is removed when the runtime directory is removed; the helper refreshes it at every login.
+
+For Wayland it records `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR`, and the Hyprland instance signature when present. For X11 it records `DISPLAY`, `XDG_RUNTIME_DIR`, and `XAUTHORITY` when present, resolving relative authentication paths before saving them. Variables belonging to the other backend, absent optional variables, and `WAYLAND_SOCKET` are unset for this service. Missing `XAUTHORITY` stays unset so normal X11 authentication fallback works. X11 startup also unsets a service-level Wayland seat setting.
+
+Run the same helper after switching desktop sessions. One user service follows the most recent startup invocation; simultaneous sessions for the same user need separate service instances. To inspect the effective configuration, use `systemctl --user cat paprika-vdagent.service`.
+
+If you stop using the helper, remove its runtime override and reload the manager:
+
+```sh
+rm -f "$XDG_RUNTIME_DIR/systemd/user/paprika-vdagent.service.d/90-paprika-session.conf"
+systemctl --user daemon-reload
+```
+
 ## 5. Verify and troubleshoot
 
-Run diagnostics from your session without sudo (choose the matching backend):
+Run diagnostics from your graphical session without sudo:
 
 ```sh
 paprika-vdagent doctor
-paprika-vdagent --backend x11 doctor
 ```
 
 The command checks the display connection, Wayland data-control protocols and requested seat or X11 selection capabilities and XFixes support, SPICE port permissions, competing stock agents, download directory, and systemd user service. It does not open the SPICE port, read or replace clipboard contents, create directories, or start/stop services. `[FAIL]` indicates a blocking problem and produces a non-zero exit status. `[WARN]` indicates an optional, incomplete, or unverified check, such as a missing service when you launch the binary directly. Successful diagnostics establish local prerequisites; test actual host/guest clipboard and file transfers separately.
@@ -192,7 +210,7 @@ Place custom options before the subcommand, or use the same environment variable
 paprika-vdagent --virtio-port /dev/virtio-ports/com.redhat.spice.0 --seat seat0 --file-dir "$HOME/Downloads" doctor
 ```
 
-Stop any manually launched Paprika process before starting the service, then run these inside your Wayland session to test immediately:
+Stop any manually launched Paprika process before starting the service, then run these inside your graphical session to test immediately:
 
 ```sh
 paprika-vdagent session-start
@@ -207,6 +225,7 @@ After reboot and login, check the status and logs again and test clipboard sync 
 | `cargo: command not found` | Install a Rust toolchain, or use a release binary/package. |
 | Permission denied opening the virtio port | Apply step 3 for the desktop user and verify device access. |
 | Port missing or service condition skipped | Verify the VM's SPICE channel; start the service again after it appears. |
+| Wrong backend selected | Check `XDG_SESSION_TYPE` and display variables, or use `--backend wayland` or `--backend x11`. |
 | Cannot connect to the X11 server | Check `DISPLAY`, `XAUTHORITY`, and session authentication; run without sudo. |
 | Cannot connect to the Wayland compositor | Run inside the guest session and import its current environment; avoid sudo. |
 | Required data-control protocol unavailable | Check compositor support for `ext-data-control` or `wlr-data-control`. |
@@ -224,7 +243,7 @@ Then restart the service. Other settings can be supplied in the same override, f
 
 ### Clipboard timeouts and recovery
 
-Clipboard payload reads have a total deadline of 2000 ms, including sources that send partial data but never finish. In X11 this includes selection target negotiation and incremental transfer events. A timed-out read leaves the cached clipboard intact and schedules another attempt after the polling interval (`--poll-ms`, default 250 ms). A fresh selection event supersedes a stalled source's retry delay. The deadline applies to receiving the payload from the clipboard owner; Display connection setup and server roundtrips still depend on the display server responding.
+Clipboard payload reads have a total deadline of 2000 ms, including sources that send partial data but never finish. In X11 this includes selection target negotiation and incremental transfer events. A timed-out read leaves the cached clipboard intact and schedules another attempt after the polling interval (`--poll-ms`, default 250 ms). A fresh selection event supersedes a stalled source's retry delay. The deadline applies to receiving the payload from the clipboard owner; display connection setup and server roundtrips still depend on the display server responding.
 
 To allow more time for a slow source, set `--clipboard-timeout-ms` when running manually, or add this to your service override:
 
@@ -235,13 +254,13 @@ Environment=PAPRIKA_VDAGENT_CLIPBOARD_TIMEOUT_MS=5000
 
 Restart the service after editing its override. Both the clipboard timeout and polling interval must be greater than zero.
 
-If the event watcher disconnects or a Wayland data-control device finishes, the bridge falls back to polling. If the display server itself is gone or the SPICE transport fails, the bridge exits with an error and the supplied systemd service restarts it. Without systemd, your session supervisor must restart it. A restarted compositor may have a different socket or session environment; run `paprika-vdagent session-start` from the new session to import it.
+If the event watcher disconnects or a Wayland data-control device finishes, the bridge falls back to polling. If the display server itself is gone or the SPICE transport fails, the bridge exits with an error and the supplied systemd service restarts it. Without systemd, your session supervisor must restart it. A restarted compositor may have a different socket or session environment; run `paprika-vdagent session-start` from the new session to update its service settings.
 
 A SPICE client disconnect cancels in-progress file transfers and resets capability negotiation. The visible clipboard stays available in the guest and is announced again after the next client negotiates its clipboard capabilities. Interrupted transfers are removed when cancelled or when the bridge exits normally, including error returns. Termination by a signal (including stopping the service), or a power failure, can leave `.paprika-vdagent-*.part` files; remove these only after stopping the bridge.
 
 ## Returning to the stock agent
 
-Remove the Paprika autostart entry, then:
+Remove the Paprika autostart entry and its runtime session override as described above, then:
 
 ```sh
 systemctl --user disable --now paprika-vdagent.service

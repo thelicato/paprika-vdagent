@@ -273,3 +273,17 @@ pub fn isolated_command(directory: &Path, program: impl AsRef<std::ffi::OsStr>) 
         .stdin(std::process::Stdio::null());
     command
 }
+
+pub fn session_start_command(directory: &Path) -> Command {
+    let bin = directory.join("session-bin");
+    fs::create_dir_all(&bin).unwrap();
+    let executable = bin.join("systemctl");
+    fs::write(&executable, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SESSION_CALLS\"\ncase \"$*\" in\n  '--user daemon-reload'|'--user restart paprika-vdagent.service') exit 0 ;;\n  *) exit 1 ;;\nesac\n").unwrap();
+    fs::set_permissions(executable, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut command = isolated_command(directory, env!("CARGO_BIN_EXE_paprika-vdagent"));
+    command
+        .env("PATH", bin)
+        .env("SESSION_CALLS", directory.join("session-calls"))
+        .arg("session-start");
+    command
+}

@@ -224,3 +224,31 @@ fn stalled_owner_is_retried_without_releasing_the_cached_clipboard() {
     );
     fixture.quiet();
 }
+
+#[test]
+#[ignore = "requires headless Sway and wl-clipboard"]
+fn auto_detection_keeps_wayland_when_xwayland_display_is_also_set() {
+    let mut fixture = Fixture::with_xwayland_hint(true);
+    fixture.wait_for_log("selected wayland clipboard backend");
+    fixture.negotiate();
+    fixture.guest_copy(Selection::Clipboard, b"native Wayland selection");
+    fixture.expect_grab(Selection::Clipboard);
+    assert_eq!(
+        fixture.request_text(Selection::Clipboard),
+        b"native Wayland selection"
+    );
+    fixture.host_copy(Selection::Clipboard, b"host Wayland text");
+    fixture.quiet();
+}
+
+#[test]
+#[ignore = "requires headless Sway and wl-clipboard"]
+fn session_start_captures_the_private_wayland_session_without_using_xwayland() {
+    let fixture = Fixture::with_xwayland_hint(true);
+    let config = fixture.session_start();
+    assert!(config.contains("Environment=\"PAPRIKA_VDAGENT_BACKEND=wayland\""));
+    assert!(config.contains(
+        "UnsetEnvironment=WAYLAND_SOCKET DISPLAY XAUTHORITY HYPRLAND_INSTANCE_SIGNATURE"
+    ));
+    assert!(!config.contains("/old-x11-authority"));
+}

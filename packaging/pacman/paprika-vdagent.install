@@ -1,15 +1,15 @@
 paprika_vdagent_note() {
   cat <<'EOF'
 Paprika needs exclusive access to the SPICE virtio port and must start inside
-  your Wayland session. Complete the persistent setup in:
+  your graphical session. Complete the persistent setup in:
 
     /usr/share/doc/paprika-vdagent/setup.md
 
   The guide covers disabling stock agents, persistent port permissions, and
-  session startup (including Hyprland Lua and Sway). Enabling the user service
-  alone is not sufficient on sessions without a current Wayland environment.
+  automatic X11/Wayland selection and session startup. Enabling the user service
+  alone is not sufficient on sessions without a current display environment.
 
-  After completing setup, launch from your compositor's autostart with:
+  After completing setup, launch from your desktop or compositor's autostart with:
     paprika-vdagent session-start
 
   View logs with:
