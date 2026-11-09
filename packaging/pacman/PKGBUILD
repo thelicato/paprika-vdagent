@@ -37,10 +37,14 @@ prepare() {
   rm -rf "$build_root_path"
   mkdir -p "$build_root_path"
 
+  # makepkg stages sources inside the checkout; never archive its own output.
   bsdtar \
     --exclude .git \
     --exclude target \
     --exclude dist \
+    --exclude './packaging/pacman/src' \
+    --exclude './packaging/pacman/pkg' \
+    --exclude '*.pkg.tar.*' \
     -cf - \
     -C "$source_root_path" \
     . | bsdtar -xf - -C "$build_root_path"
