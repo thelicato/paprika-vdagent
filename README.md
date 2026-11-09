@@ -89,7 +89,7 @@ Install the package with your distro tools, or unpack the tarball and run `papri
 
 The packaged installs include a systemd user service at `/usr/lib/systemd/user/paprika-vdagent.service`. It is not enabled automatically.
 
-For persistent setup, follow **[Installation and session startup](docs/setup.md)**. The guide covers package installation on common distributions, disabling competing stock agents, persistent port permissions, Hyprland Lua and legacy configuration, Sway, other session managers, and troubleshooting.
+For persistent setup, follow **[Installation and session startup](docs/setup.md)**. The guide covers package and source installation, disabling stock agents at both system and desktop startup, dedicated-group port permissions, graphical-session startup, and clipboard troubleshooting.
 
 Start Paprika from your graphical session after login so it receives the current display environment. Enabling the user service alone does not configure port permissions or guarantee that environment is available.
 

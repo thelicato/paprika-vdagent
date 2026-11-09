@@ -2,6 +2,8 @@
 
 Paprika runs **inside the guest's graphical session**, after login. It needs access to the SPICE virtio port and either a Wayland compositor exposing `ext-data-control` or `wlr-data-control`, or an X11 server. The default `--backend auto` selects the native session; `--backend wayland` and `--backend x11` provide explicit overrides. A distro's package format does not determine display compatibility. The steps below assume one desktop user per guest.
 
+Follow steps 1–3, choose a graphical-session startup method in step 4, then reboot and run the checks in step 5. Run guest commands as your desktop user, using sudo only where shown.
+
 ## 1. Install
 
 ### Distribution packages
@@ -18,6 +20,17 @@ Download the release package for your architecture, then use your distro's tool 
 Packages include the binary and a systemd user service. Continue with step 2.
 
 ### Build from source or use a tarball
+
+On apt-based distributions, install the build dependencies and clone the repository:
+
+```sh
+sudo apt update
+sudo apt install -y git build-essential pkg-config libwayland-dev cargo rustc
+git clone https://github.com/thelicato/paprika-vdagent.git
+cd paprika-vdagent
+```
+
+If you already have a checkout, use that repository instead of cloning it again.
 
 Build with a Rust toolchain supporting edition 2024 and your distro's Wayland development packages:
 
@@ -44,7 +57,10 @@ For a manual source install, run these from the repository root:
 sudo install -Dm755 target/release/paprika-vdagent /usr/bin/paprika-vdagent
 sudo install -Dm644 packaging/systemd/user/paprika-vdagent.service \
   /usr/lib/systemd/user/paprika-vdagent.service
+systemctl --user daemon-reload
 ```
+
+After rebuilding an existing installation, repeat the binary installation command and run `paprika-vdagent session-start` from your graphical session to restart with the updated binary.
 
 Tarballs include this guide in `docs/` and the service in `packaging/systemd/user/`. For tarballs, install the extracted binary at `/usr/bin/paprika-vdagent` and the [service file](../packaging/systemd/user/paprika-vdagent.service) at `/usr/lib/systemd/user/paprika-vdagent.service`, or run the binary directly using your compositor's autostart mechanism.
 
@@ -58,6 +74,25 @@ pkill -x spice-vdagent || true
 ```
 
 If your distribution uses different unit names, inspect `systemctl list-unit-files 'spice*'` and stop/mask the corresponding daemon and socket. If no stock agent is installed, skip this step. Remove any explicit `spice-vdagent` launch from your session startup configuration as well.
+
+### Disable the stock desktop autostart entry
+
+Desktops supporting XDG autostart may launch the stock session agent independently of systemd. Masking the daemon and socket does not disable desktop autostart entries. Check for a stock entry such as `/etc/xdg/autostart/spice-vdagent.desktop`, then create a per-user override with the same filename:
+
+```sh
+mkdir -p ~/.config/autostart
+cat > ~/.config/autostart/spice-vdagent.desktop <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=Spice vdagent
+Hidden=true
+EOF
+pkill -x spice-vdagent || true
+```
+
+If an override already exists, preserve any settings you need and set `Hidden=true`. On other desktops, check the system XDG autostart directories and override the stock entry's actual filename.
+
+Without this override, `doctor` can report a competing `spice-vdagent` immediately after login, then pass a minute or two later when that process exits. Disable its startup rather than waiting for it to disappear each login.
 
 Masking persists across reboots and prevents socket activation. Paprika replaces the stock clipboard and incoming file-transfer path; other stock-agent features are outside its scope.
 
@@ -80,16 +115,21 @@ printf 'SUBSYSTEM=="virtio-ports", ATTR{name}=="com.redhat.spice.0", GROUP="papr
   sudo tee /etc/udev/rules.d/99-paprika-vdagent.rules
 sudo udevadm control --reload-rules
 sudo udevadm trigger --subsystem-match=virtio-ports
+sudo udevadm settle
 ```
+
+Reboot after completing the startup configuration in step 4 so both the graphical session and the systemd user manager receive the new group membership. Opening another terminal alone does not refresh those processes' groups.
 
 Verify access without sudo:
 
 ```sh
+id -nG
+ls -lL /dev/virtio-ports/com.redhat.spice.0
 test -r /dev/virtio-ports/com.redhat.spice.0 &&
   test -w /dev/virtio-ports/com.redhat.spice.0 && echo 'Port access OK'
 ```
 
-Reboot after adding yourself to the group so both the graphical session and the systemd user manager receive the new membership. Then run the access check above again.
+Your groups should include `paprika-vdagent`, and the device should show `root paprika-vdagent` with permissions `crw-rw----`.
 
 See the [udev rule reference](https://www.freedesktop.org/software/systemd/man/latest/udev.html) for the matching and permission fields. A dedicated system group avoids udev versions that reject desktop users in `OWNER`, including numeric IDs, with “Not a system user.” Only members of this group receive access through this rule. Running Paprika with sudo is unnecessary and can prevent it from connecting to your graphical session.
 
@@ -127,14 +167,17 @@ The startup helper requires an existing absolute `XDG_RUNTIME_DIR` and the selec
 
 ### X11 and desktops supporting XDG autostart
 
-Add `paprika-vdagent session-start` to your desktop or window manager's autostart configuration. For desktops supporting XDG autostart, create `~/.config/autostart/paprika-vdagent.desktop` with:
+Add `paprika-vdagent session-start` to your desktop or window manager's autostart configuration. For desktops supporting XDG autostart:
 
-```ini
+```sh
+mkdir -p ~/.config/autostart
+cat > ~/.config/autostart/paprika-vdagent.desktop <<'EOF'
 [Desktop Entry]
 Type=Application
 Name=Paprika SPICE clipboard bridge
 Exec=/usr/bin/paprika-vdagent session-start
 Terminal=false
+EOF
 ```
 
 This entry can be used across X11 and Wayland sessions when the desktop supports XDG autostart. Replace an older X11-only entry that starts the bridge directly with `--backend x11`; use one launch method per session. The stock SPICE agents must remain stopped and the port permissions from steps 2 and 3 still apply.
@@ -151,7 +194,7 @@ hl.on("hyprland.start", function()
 end)
 ```
 
-This uses Hyprland's [startup event](https://wiki.hypr.land/configuring/core/autostart/). It runs when Hyprland starts, rather than on configuration reload. Log out and back in to test it. This is the setup verified on CachyOS with Hyprland 0.56.2.
+This uses Hyprland's [startup event](https://wiki.hypr.land/configuring/core/autostart/). It runs when Hyprland starts, rather than on configuration reload. Log out and back in to test it.
 
 ### Hyprland: older hyprlang configuration
 
@@ -219,10 +262,12 @@ Stop any manually launched Paprika process before starting the service, then run
 ```sh
 paprika-vdagent session-start
 systemctl --user status paprika-vdagent.service
-journalctl --user -u paprika-vdagent.service -b --no-pager
+journalctl --user -u paprika-vdagent.service -b -n 50 --no-pager
 ```
 
 After reboot and login, check the status and logs again and test clipboard sync in both directions with your SPICE client connected.
+
+Copy fresh plain text on the host and paste into a guest text editor, then copy different guest text and paste on the host. Use Ctrl+V in a text editor or Ctrl+Shift+V in most terminals. Test an incoming file transfer separately if your viewer supports it; incoming files go to `~/Downloads` by default.
 
 | Symptom | Check |
 | --- | --- |
@@ -235,6 +280,7 @@ After reboot and login, check the status and logs again and test clipboard sync 
 | Required data-control protocol unavailable | Check compositor support for `ext-data-control` or `wlr-data-control`. |
 | Service unit not found | Install the service file and run `systemctl --user daemon-reload`. |
 | Starts, but clipboard does not sync | Check for competing stock/manual agents and inspect debug logs. |
+| Competing `spice-vdagent` just after login, then diagnostics pass | Disable the stock desktop autostart entry in step 2; systemd masks alone do not stop it. |
 
 For debug logs, use `systemctl --user edit paprika-vdagent.service`:
 
@@ -244,6 +290,14 @@ Environment=RUST_LOG=paprika_vdagent=debug
 ```
 
 Then restart the service. Other settings can be supplied in the same override, for example `Environment=PAPRIKA_VDAGENT_FILE_DIR=/home/your-user/Downloads`.
+
+### Clipboard works in only one direction
+
+After installing or restarting the guest agent, reconnect the host viewer and copy fresh plain text before testing again. Check the viewer's clipboard-sharing settings if available.
+
+If the problem persists, enable Paprika's debug logs as above and watch the guest journal while copying on the host. A host copy offering UTF-8 text normally produces `host claimed clipboard ownership`, followed by `received host clipboard text`. A `discarding stale host clipboard GRAB` message means an announcement arrived but failed serial validation. If there are no incoming clipboard messages during the attempt, inspect the host viewer and QEMU clipboard configuration as well as the guest configuration. Use the viewer's own diagnostics to check whether it detects host clipboard changes and forwards them to the VM.
+
+Remove the Paprika debug environment line from your service override when finished, then reload and restart the user service to return to normal logging.
 
 ### Clipboard timeouts and recovery
 
@@ -272,5 +326,7 @@ sudo rm -f /etc/udev/rules.d/99-paprika-vdagent.rules
 sudo udevadm control --reload-rules
 sudo systemctl unmask spice-vdagentd.service spice-vdagentd.socket
 ```
+
+If you created the `Hidden=true` stock-agent override in step 2, remove `~/.config/autostart/spice-vdagent.desktop` to allow the system autostart entry again. If you modified a pre-existing override, restore its previous settings instead.
 
 Reboot to restore device permissions and your distro's normal session startup. If the stock daemon or socket was previously disabled, re-enable the appropriate unit according to your distro's setup.
