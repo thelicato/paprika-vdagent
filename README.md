@@ -137,6 +137,16 @@ If needed, you can pin a specific seat:
 RUST_LOG=paprika_vdagent=debug ./target/release/paprika-vdagent --seat seat0
 ```
 
+## Roadmap
+
+The following features are available in the stock Linux SPICE guest agent stack and are not yet implemented in Paprika. This list does not imply a delivery order or timeline.
+
+- [ ] Automatically resize the guest display to match the viewer window.
+- [ ] Configure multiple monitors and their display layouts.
+- [ ] Support agent-based mouse integration through `uinput`.
+- [ ] Synchronize image clipboard contents in addition to text.
+- [ ] Route clipboard and file transfers to the active user's graphical session when switching users.
+
 ## Testing
 
 Run `cargo test --locked` for the standard suite. Full-bridge integration tests use private headless Sway or authenticated Xvfb instances and a simulated SPICE connection. See [Testing](docs/testing.md) for dependencies, commands, coverage, and limitations.
