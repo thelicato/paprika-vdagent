@@ -74,7 +74,9 @@ If absent, configure a SPICE guest-agent channel in the VM settings on the host.
 If your desktop user already has read/write access, no rule is needed. Otherwise, run the following **as the desktop user**, using sudo only as shown. This grants that user access to this specific port, including after reboot:
 
 ```sh
-printf 'SUBSYSTEM=="virtio-ports", ATTR{name}=="com.redhat.spice.0", OWNER="%s", MODE="0600"\n' "$(id -un)" |
+sudo groupadd --system --force paprika-vdagent
+sudo usermod -aG paprika-vdagent "$(id -un)"
+printf 'SUBSYSTEM=="virtio-ports", ATTR{name}=="com.redhat.spice.0", GROUP="paprika-vdagent", MODE="0660"\n' |
   sudo tee /etc/udev/rules.d/99-paprika-vdagent.rules
 sudo udevadm control --reload-rules
 sudo udevadm trigger --subsystem-match=virtio-ports
@@ -87,7 +89,9 @@ test -r /dev/virtio-ports/com.redhat.spice.0 &&
   test -w /dev/virtio-ports/com.redhat.spice.0 && echo 'Port access OK'
 ```
 
-See the [udev rule reference](https://www.freedesktop.org/software/systemd/man/latest/udev.html) for the matching and permission fields. This rule selects one user; multi-user guests need an administrator-managed group or active-session access policy instead. Running Paprika with sudo is unnecessary and can prevent it from connecting to your Wayland session.
+Reboot after adding yourself to the group so both the graphical session and the systemd user manager receive the new membership. Then run the access check above again.
+
+See the [udev rule reference](https://www.freedesktop.org/software/systemd/man/latest/udev.html) for the matching and permission fields. A dedicated system group avoids udev versions that reject desktop users in `OWNER`, including numeric IDs, with “Not a system user.” Only members of this group receive access through this rule. Running Paprika with sudo is unnecessary and can prevent it from connecting to your graphical session.
 
 For temporary testing only, the following grants access until the device is recreated. The `setfacl` command is provided by the `acl` package on Arch/CachyOS:
 

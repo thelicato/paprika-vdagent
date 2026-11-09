@@ -112,8 +112,9 @@ impl SpiceTransport {
                 return Ok(false);
             }
 
-            let serial = state.serial_counter;
-            state.serial_counter = state.serial_counter.wrapping_add(1);
+            let counter = &mut state.serial_counters[selection.spice_id() as usize];
+            let serial = *counter;
+            *counter = counter.wrapping_add(1);
             (
                 state.clipboard_selection,
                 state.clipboard_grab_serial,
@@ -306,7 +307,7 @@ fn reader_loop(
                         has_capability(&caps, VD_AGENT_CAP_CLIPBOARD_SELECTION);
                     guard.clipboard_grab_serial =
                         has_capability(&caps, VD_AGENT_CAP_CLIPBOARD_GRAB_SERIAL);
-                    guard.serial_counter = 0;
+                    guard.serial_counters = [0; 2];
 
                     debug!(
                         "peer capabilities: clipboard_by_demand={} selection={} grab_serial={}",
@@ -479,6 +480,46 @@ mod tests {
             events.recv_timeout(Duration::from_secs(2)).unwrap(),
             TransportEvent::PeerCapabilities(_)
         ));
+    }
+
+    #[test]
+    fn primary_grabs_do_not_make_host_clipboard_grabs_stale() {
+        let (transport, mut host, events) = connect();
+        let caps = (1 << VD_AGENT_CAP_CLIPBOARD_BY_DEMAND)
+            | (1 << VD_AGENT_CAP_CLIPBOARD_SELECTION)
+            | (1 << VD_AGENT_CAP_CLIPBOARD_GRAB_SERIAL);
+        announce(&mut host, &events, caps);
+
+        for expected_serial in 0..5 {
+            transport
+                .send_clipboard_grab_text(ClipboardSelection::Primary)
+                .unwrap();
+            let (_, payload) = read_message(&mut host);
+            assert_eq!(le_u32(&payload[4..8]), expected_serial);
+        }
+        transport
+            .send_clipboard_grab_text(ClipboardSelection::Clipboard)
+            .unwrap();
+        let (_, payload) = read_message(&mut host);
+        assert_eq!(le_u32(&payload[4..8]), 0);
+
+        let mut payload = selection_prefix(ClipboardSelection::Clipboard).to_vec();
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.extend_from_slice(&VD_AGENT_CLIPBOARD_UTF8_TEXT.to_le_bytes());
+        host.write_all(&encode_message_frame(VD_AGENT_CLIPBOARD_GRAB, &payload))
+            .unwrap();
+        match events.recv_timeout(Duration::from_secs(2)).unwrap() {
+            TransportEvent::HostGrab {
+                selection,
+                serial,
+                types,
+            } => {
+                assert_eq!(selection, ClipboardSelection::Clipboard);
+                assert_eq!(serial, Some(1));
+                assert_eq!(types, vec![VD_AGENT_CLIPBOARD_UTF8_TEXT]);
+            }
+            other => panic!("expected host clipboard grab, got {other:?}"),
+        }
     }
 
     #[test]

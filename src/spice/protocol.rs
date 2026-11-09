@@ -81,7 +81,8 @@ pub(super) struct TransportState {
     pub(super) clipboard_by_demand: bool,
     pub(super) clipboard_selection: bool,
     pub(super) clipboard_grab_serial: bool,
-    pub(super) serial_counter: u32,
+    // CLIPBOARD and PRIMARY have independent serial sequences on the peer.
+    pub(super) serial_counters: [u32; 2],
 }
 
 pub(super) fn parse_capabilities(data: &[u8]) -> Result<Vec<u32>> {
@@ -100,7 +101,7 @@ pub(super) fn parse_clipboard_grab(
     state: &Arc<Mutex<TransportState>>,
     data: &[u8],
 ) -> Result<(u8, Option<u32>, Vec<u32>)> {
-    let guard = state.lock().map_err(|_| anyhow!("state mutex poisoned"))?;
+    let mut guard = state.lock().map_err(|_| anyhow!("state mutex poisoned"))?;
     let mut offset = 0usize;
     let mut selection = ClipboardSelection::Clipboard.spice_id();
     let mut serial = None;
@@ -118,18 +119,19 @@ pub(super) fn parse_clipboard_grab(
             bail!("clipboard GRAB missing serial field");
         }
         let value = le_u32(&data[offset..offset + 4]);
-        if value < guard.serial_counter {
+        let Some(selection_kind) = ClipboardSelection::from_spice_id(selection) else {
+            return Ok((selection, Some(value), Vec::new()));
+        };
+        let index = selection_kind.spice_id() as usize;
+        if value < guard.serial_counters[index] {
             debug!(
                 "discarding stale host clipboard GRAB serial {} < {}",
-                value, guard.serial_counter
+                value, guard.serial_counters[index]
             );
             return Ok((selection, Some(value), Vec::new()));
         }
         serial = Some(value);
-        drop(guard);
-
-        let mut guard = state.lock().map_err(|_| anyhow!("state mutex poisoned"))?;
-        guard.serial_counter = value;
+        guard.serial_counters[index] = value;
         offset += 4;
     }
 
@@ -301,7 +303,7 @@ mod tests {
             clipboard_by_demand: true,
             clipboard_selection: selection,
             clipboard_grab_serial: serial,
-            serial_counter,
+            serial_counters: [serial_counter; 2],
         }))
     }
 
@@ -330,7 +332,7 @@ mod tests {
         assert_eq!(selection, ClipboardSelection::Clipboard.spice_id());
         assert_eq!(serial, Some(9));
         assert_eq!(types, vec![VD_AGENT_CLIPBOARD_UTF8_TEXT]);
-        assert_eq!(state.lock().unwrap().serial_counter, 9);
+        assert_eq!(state.lock().unwrap().serial_counters[0], 9);
     }
 
     #[test]
@@ -362,7 +364,7 @@ mod tests {
         assert_eq!(selection, ClipboardSelection::Clipboard.spice_id());
         assert_eq!(serial, Some(3));
         assert!(types.is_empty());
-        assert_eq!(state.lock().unwrap().serial_counter, 10);
+        assert_eq!(state.lock().unwrap().serial_counters[0], 10);
     }
 
     #[test]
